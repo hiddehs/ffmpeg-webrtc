@@ -198,6 +198,8 @@ typedef struct RTCContext {
     /* The time jitter base for audio OPUS stream. */
     int64_t audio_jitter_base;
 
+    /* The URL with query string for the WebRTC server. */
+    char * whip_api_url;
     /* The UDP transport is used for delivering ICE, DTLS and SRTP packets. */
     URLContext *udp_uc;
 
@@ -211,6 +213,8 @@ typedef struct RTCContext {
     int dtls_arq_timeout;
     /* The size of RTP packet, should generally be set to MTU. */
     int pkt_size;
+    /* Whether to send RTP packets in plain text or use SRTP encryption for enhanced security. */
+    int rtp_plaintext;
 } RTCContext;
 
 static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size);
@@ -220,18 +224,52 @@ static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size);
  */
 static int whip_init(AVFormatContext *s)
 {
-    int ideal_pkt_size = 532;
+    AVBPrint bp;
+    int ret = 0, ideal_pkt_size = 532;
     RTCContext *rtc = s->priv_data;
 
-    av_log(s, AV_LOG_INFO, "WHIP: Init ice_arq_max=%d, ice_arq_timeout=%d, dtls_arq_max=%d, dtls_arq_timeout=%d pkt_size=%d\n",
-        rtc->ice_arq_max, rtc->ice_arq_timeout, rtc->dtls_arq_max, rtc->dtls_arq_timeout, rtc->pkt_size);
+    /* To prevent a crash during cleanup, always initialize it. */
+    av_bprint_init(&bp, 1, MAX_SDP_SIZE);
+
+    av_bprintf(&bp, "%s", s->url);
+    if (rtc->rtp_plaintext) {
+        if (!av_stristr(bp.str, "?")) {
+            av_bprintf(&bp, "%s", "?");
+        }
+        if (av_stristr(bp.str, "&")) {
+            av_bprintf(&bp, "%s", "&");
+        }
+        if (rtc->rtp_plaintext) {
+            av_bprintf(&bp, "%s", "encrypt=false");
+        }
+    }
+
+    if (!av_bprint_is_complete(&bp)) {
+        av_log(s, AV_LOG_ERROR, "WHIP: Failed to init url=%s, rtp_plaintext=%d to %s\n",
+            s->url, rtc->rtp_plaintext, bp.str);
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
+    rtc->whip_api_url = av_strdup(bp.str);
+    if (!rtc->whip_api_url) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
+    av_log(s, AV_LOG_INFO, "WHIP: Init ice_arq_max=%d, ice_arq_timeout=%d, dtls_arq_max=%d, dtls_arq_timeout=%d, "
+        "pkt_size=%d, rtp_plaintext=%d, whip_api_url=%s\n",
+        rtc->ice_arq_max, rtc->ice_arq_timeout, rtc->dtls_arq_max, rtc->dtls_arq_timeout, rtc->pkt_size,
+        rtc->rtp_plaintext, rtc->whip_api_url);
 
     if (rtc->pkt_size < ideal_pkt_size) {
         av_log(s, AV_LOG_WARNING, "WHIP: pkt_size=%d(<%d) is too small, may cause packet loss\n",
             rtc->pkt_size, ideal_pkt_size);
     }
 
-    return 0;
+end:
+    av_bprint_finalize(&bp, NULL);
+    return ret;
 }
 
 /**
@@ -640,8 +678,8 @@ end:
 static int exchange_sdp(AVFormatContext *s)
 {
     int ret;
-    char buf[MAX_URL_SIZE];
     AVBPrint bp;
+    char buf[MAX_URL_SIZE];
     RTCContext *rtc = s->priv_data;
     /* The URL context is an HTTP transport layer for the WHIP protocol. */
     URLContext *whip_uc = NULL;
@@ -649,9 +687,9 @@ static int exchange_sdp(AVFormatContext *s)
     /* To prevent a crash during cleanup, always initialize it. */
     av_bprint_init(&bp, 1, MAX_SDP_SIZE);
 
-    ret = ffurl_alloc(&whip_uc, s->url, AVIO_FLAG_READ_WRITE, &s->interrupt_callback);
+    ret = ffurl_alloc(&whip_uc, rtc->whip_api_url, AVIO_FLAG_READ_WRITE, &s->interrupt_callback);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to alloc HTTP context: %s\n", s->url);
+        av_log(s, AV_LOG_ERROR, "Failed to alloc HTTP context: %s\n", rtc->whip_api_url);
         goto end;
     }
 
@@ -670,7 +708,7 @@ static int exchange_sdp(AVFormatContext *s)
 
     ret = ffurl_connect(whip_uc, NULL);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to request url=%s, offer: %s\n", s->url, rtc->sdp_offer);
+        av_log(s, AV_LOG_ERROR, "Failed to request url=%s, offer: %s\n", rtc->whip_api_url, rtc->sdp_offer);
         goto end;
     }
 
@@ -691,7 +729,7 @@ static int exchange_sdp(AVFormatContext *s)
         }
         if (ret <= 0) {
             av_log(s, AV_LOG_ERROR, "Failed to read response from url=%s, offer is %s, answer is %s\n",
-                s->url, rtc->sdp_offer, rtc->sdp_answer);
+                rtc->whip_api_url, rtc->sdp_offer, rtc->sdp_answer);
             goto end;
         }
 
@@ -1508,7 +1546,7 @@ static int create_rtp_muxer(AVFormatContext *s)
             goto end;
         }
 
-        ff_format_set_url(rtp_ctx, av_strdup(s->url));
+        ff_format_set_url(rtp_ctx, av_strdup(rtc->whip_api_url));
         s->streams[i]->time_base = rtp_ctx->streams[0]->time_base;
         s->streams[i]->priv_data = rtp_ctx;
         rtp_ctx = NULL;
@@ -1573,19 +1611,25 @@ static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size)
         }
     }
 
-    /* Get the corresponding SRTP context. */
-    srtp = is_rtcp ? &rtc->srtp_rtcp_send : (is_video? &rtc->srtp_video_send : &rtc->srtp_audio_send);
+    if (rtc->rtp_plaintext) {
+        /* Send out the plaintext RTP packet directly. */
+        ret = ffurl_write(rtc->udp_uc, buf, buf_size);
+    } else {
+        /* Get the corresponding SRTP context. */
+        srtp = is_rtcp ? &rtc->srtp_rtcp_send : (is_video ? &rtc->srtp_video_send : &rtc->srtp_audio_send);
 
-    /* Encrypt by SRTP and send out. */
-    cipher_size = ff_srtp_encrypt(srtp, buf, buf_size, cipher, sizeof(cipher));
-    if (cipher_size <= 0 || cipher_size < buf_size) {
-        av_log(s, AV_LOG_WARNING, "Failed to encrypt packet=%dB, cipher=%dB\n", buf_size, cipher_size);
-        return 0;
+        /* Encrypt by SRTP and send out. */
+        cipher_size = ff_srtp_encrypt(srtp, buf, buf_size, cipher, sizeof(cipher));
+        if (cipher_size <= 0 || cipher_size < buf_size) {
+            av_log(s, AV_LOG_WARNING, "Failed to encrypt packet=%dB, cipher=%dB\n", buf_size, cipher_size);
+            return 0;
+        }
+
+        ret = ffurl_write(rtc->udp_uc, cipher, cipher_size);
     }
-
-    ret = ffurl_write(rtc->udp_uc, cipher, cipher_size);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to write packet=%dB, ret=%d\n", cipher_size, ret);
+        av_log(s, AV_LOG_ERROR, "Failed to write packet=%dB, plaintext=%d, ret=%d\n",
+            cipher_size, rtc->rtp_plaintext, ret);
         return ret;
     }
 
@@ -1679,7 +1723,7 @@ static int whip_dispose(AVFormatContext *s)
 
     ret = ffurl_alloc(&whip_uc, rtc->whip_resource_url, AVIO_FLAG_READ_WRITE, &s->interrupt_callback);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to alloc WHIP delete context: %s\n", s->url);
+        av_log(s, AV_LOG_ERROR, "Failed to alloc WHIP delete context: %s\n", rtc->whip_api_url);
         goto end;
     }
 
@@ -1820,6 +1864,7 @@ static av_cold void rtc_deinit(AVFormatContext *s)
     av_freep(&rtc->ice_pwd_remote);
     av_freep(&rtc->ice_protocol);
     av_freep(&rtc->ice_host);
+    av_freep(&rtc->whip_api_url);
     ffurl_closep(&rtc->udp_uc);
     ff_srtp_free(&rtc->srtp_audio_send);
     ff_srtp_free(&rtc->srtp_video_send);
@@ -1835,6 +1880,7 @@ static const AVOption options[] = {
     { "dtls_arq_max",       "Maximum number of retransmissions for the DTLS ARQ mechanism",     OFFSET(dtls_arq_max),       AV_OPT_TYPE_INT,    { .i64 = 5 },       -1, INT_MAX, DEC },
     { "dtls_arq_timeout",   "Start timeout in milliseconds for the DTLS ARQ mechanism",         OFFSET(dtls_arq_timeout),   AV_OPT_TYPE_INT,    { .i64 = 50 },      -1, INT_MAX, DEC },
     { "pkt_size",           "The maximum size, in bytes, of RTP packets that send out",         OFFSET(pkt_size),           AV_OPT_TYPE_INT,    { .i64 = 1500 },    -1, INT_MAX, DEC },
+    { "rtp_plaintext",      "Whether to use plain text RTP. If not, encrypted by SRTP.",        OFFSET(rtp_plaintext),      AV_OPT_TYPE_BOOL,   { .i64 = 0 },       0,  1,       DEC },
     { NULL },
 };
 
