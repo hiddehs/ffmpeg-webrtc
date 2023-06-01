@@ -58,6 +58,7 @@
 #include "mux.h"
 #include "network.h"
 #include "srtp.h"
+int64_t cur_time;
 
 /**
  * Maximum size limit of a Session Description Protocol (SDP),
@@ -132,13 +133,13 @@
  * In this situation, we wait briefly and attempt to read the response again.
  * We limit the maximum number of times we retry this loop.
  */
-#define DTLS_EAGAIN_RETRIES_MAX 5
+#define DTLS_EAGAIN_RETRIES_MAX 10
 
 /**
  * The DTLS timer's base timeout in microseconds. Its purpose is to minimize the unnecessary
  * retransmission of ClientHello.
  */
-#define DTLS_SSL_TIMER_BASE 400 * 1000
+#define DTLS_SSL_TIMER_BASE 10 * 1000
 
 /* The magic cookie for Session Traversal Utilities for NAT (STUN) messages. */
 #define STUN_MAGIC_COOKIE 0x2112A442
@@ -444,7 +445,7 @@ static unsigned int openssl_dtls_timer_cb(SSL *dtls, unsigned int previous_us)
     /* If previous_us is 0, for example, the HelloVerifyRequest, we should respond it ASAP.
      * when got ServerHello, we should reset the timer. */
     if (!previous_us || ctx->dtls_should_reset_timer)
-        timeout_us =  DTLS_SSL_TIMER_BASE + ctx->dtls_arq_timeout * 1000; /* in us */
+        timeout_us =  1000 * 1000 + DTLS_SSL_TIMER_BASE + ctx->dtls_arq_timeout * 1000; /* in us */
 
     /* never exceed the max timeout. */
     timeout_us = FFMIN(timeout_us, 30 * 1000 * 1000); /* in us */
@@ -474,6 +475,10 @@ static void openssl_state_trace(DTLSContext *ctx, uint8_t *data, int length, int
     av_log(s1, AV_LOG_VERBOSE, "WHIP: DTLS state %s %s, done=%u, arq=%u, r0=%d, r1=%d, len=%u, cnt=%u, size=%u, hs=%u\n",
         "Active", (incoming? "RECV":"SEND"), ctx->dtls_done_for_us, ctx->dtls_arq_packets, r0, r1, length,
         content_type, size, handshake_type);
+}
+
+static int openssl_verify_callback(int preverify_ok, X509_STORE_CTX *ctx) {
+    return 1;
 }
 
 /**
@@ -512,6 +517,10 @@ static av_cold int openssl_init_dtls_context(DTLSContext *ctx, SSL_CTX *dtls_ctx
         ret = AVERROR(EINVAL);
         goto end;
     }
+    // Server will send Certificate Request.
+    // @see https://www.openssl.org/docs/man1.0.2/man3/SSL_CTX_set_verify.html
+    // TODO: FIXME: Config it, default to off to make the packet smaller.
+    SSL_CTX_set_verify(dtls_ctx, SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE, openssl_verify_callback);
     /* The depth count is "level 0:peer certificate", "level 1: CA certificate",
      * "level 2: higher level CA certificate", and so on. */
     SSL_CTX_set_verify_depth(dtls_ctx, 4);
@@ -550,12 +559,19 @@ static av_cold int openssl_init_dtls_ssl(DTLSContext *ctx, SSL *dtls)
 #endif
 
     /* Setup DTLS as active, which is client role. */
-    SSL_set_connect_state(dtls);
+    //SSL_set_connect_state(dtls);
+    // Dtls setup passive, as server role.
+    SSL_set_accept_state(dtls);
     SSL_set_max_send_fragment(dtls, ctx->pkt_size);
+    SSL_set_mtu(dtls, ctx->pkt_size);
 
     return ret;
 }
 
+int nn_clienthello = 0;
+int nn_certificates = 0;
+int nn_certificate_verifies = 0;
+int nn_serverhello = 0;
 /**
  * Drives the SSL context by attempting to read packets to send from SSL, sending them
  * over UDP, and then reading packets from UDP to feed back to SSL.
@@ -564,17 +580,18 @@ static int openssl_drive_context(DTLSContext *ctx, SSL *dtls, BIO *bio_in, BIO *
 {
     int ret, i, j, r0, r1, req_size, res_size = 0;
     uint8_t *data = NULL, req_ct = 0, req_ht = 0, res_ct = 0, res_ht = 0;
-    char buf[MAX_UDP_BUFFER_SIZE];
+    uint8_t buf[MAX_UDP_BUFFER_SIZE];
     void *s1 = ctx->log_avcl;
 
     /* Drive the SSL context by state change, arq or response messages. */
     r0 = SSL_do_handshake(dtls);
     r1 = SSL_get_error(dtls, r0);
+    printf("SSL_do_handshake r0=%d, r1=%d\n", r0, r1);
 
     /* Handshake successfully done */
     if (r0 == 1) {
-        ctx->dtls_done_for_us = 1;
-        return 0;
+        ctx->dtls_done_for_us++;
+        //return 0;
     }
 
     /* Handshake failed with fatal error */
@@ -586,24 +603,59 @@ static int openssl_drive_context(DTLSContext *ctx, SSL *dtls, BIO *bio_in, BIO *
     /* Fast retransmit the request util got response. */
     for (i = 0; i <= ctx->dtls_arq_max && !res_size; i++) {
         req_size = BIO_get_mem_data(bio_out, (char**)&data);
+        printf("BIO_get_mem_data req=%d, done=%d\n", req_size, ctx->dtls_done_for_us);
         openssl_state_trace(ctx, data, req_size, 0, r0, r1);
-        ret = ffurl_write(ctx->udp_uc, data, req_size);
+        int is_serverhello = 0;
+        if (req_size>13 && data[0] == 0x16 && data[13] == 0x02) {
+            is_serverhello = 1;
+            nn_serverhello++;
+        }
+        if (!is_serverhello || nn_serverhello <= 1)
+            if (req_size < ctx->pkt_size)
+                ret = ffurl_write(ctx->udp_uc, data, req_size);
+            else {
+                int left = req_size;
+                while (left > 0) {
+                    char* p = data + req_size - left;
+                    int nn = 13 + ((int)(uint8_t)p[11])*256 + (uint8_t)p[12];
+                    nn = FFMIN(nn, left);
+                    nn = FFMIN(nn, ctx->pkt_size);
+                    printf("Split large=%d UDP to %d packet\n", req_size, nn);
+                    ret = ffurl_write(ctx->udp_uc, p, nn);
+                    left -= nn;
+                }
+            }
         BIO_reset(bio_out);
         req_ct = req_size > 0 ? data[0] : 0;
         req_ht = req_size > 13 ? data[13] : 0;
         if (ret < 0) {
-            av_log(s1, AV_LOG_ERROR, "DTLS: Send request failed, loop=%d, content=%d, handshake=%d, size=%d\n",
-                loop, req_ct, req_ht, req_size);
+            av_log(s1, AV_LOG_ERROR, "DTLS: Send request failed, loop=%d, content=%d, handshake=%d, size=%d, ret=%d\n",
+                loop, req_ct, req_ht, req_size, ret);
             return ret;
         }
 
         /* Wait so that the server can process the request and no need ARQ then. */
 #if DTLS_PROCESSING_TIMEOUT > 0
-        av_usleep(DTLS_PROCESSING_TIMEOUT * 10000);
+        av_usleep(DTLS_PROCESSING_TIMEOUT * 1000);
 #endif
 
         for (j = 0; j <= DTLS_EAGAIN_RETRIES_MAX && !res_size; j++) {
             ret = ffurl_read(ctx->udp_uc, buf, sizeof(buf));
+            printf("time dtls-read=%llu, cost=%dms\n", av_gettime_relative()/1000, (av_gettime_relative()-cur_time)/1000); cur_time = av_gettime_relative();
+            int is_clienthello = 0, is_certificate = 0, is_verify_certificate = 0;
+            for (char *p=buf; ret > 13 && p < buf + ret;) {
+                int nn = 13 + ((int)(uint8_t)p[11])*256 + (uint8_t)p[12];
+                if (ret>13 && p[0] == 0x16 && p[13] == 0x01 && !is_clienthello) {nn_clienthello++; is_clienthello = 1;}
+                if (ret>13 && p[0] == 0x16 && p[13] == 0x0b && !is_certificate) {nn_certificates++; is_certificate = 1;}
+                if (ret>13 && p[0] == 0x16 && p[13] == 0x0f && !is_verify_certificate) {nn_certificate_verifies++; is_verify_certificate=1;}
+                p += nn;
+            }
+            if (ret> 0) printf("ffurl_read size=%d, chello=%d, certificates=%d, verifies=%d, %x %x %x %x ... %x %x %x %x\n", ret, nn_clienthello, nn_certificates, nn_certificate_verifies, buf[0], buf[1], buf[2], buf[3], buf[ret-4], buf[ret-3], buf[ret-2], buf[ret-1]);
+            if (is_certificate && nn_certificates == 1) {
+                printf(">>>> ignore size=%d\n", ret);
+                av_usleep(200 * 1000);
+                continue;
+            }
 
             /* Ignore other packets, such as ICE indication, except DTLS. */
             if (ret > 0 && (ret < 13 || buf[0] <= 19 || buf[0] >= 64))
@@ -629,7 +681,7 @@ static int openssl_drive_context(DTLSContext *ctx, SSL *dtls, BIO *bio_in, BIO *
              * occurs, it returns -1. */
             r0 = DTLSv1_handle_timeout(dtls);
             if (!r0) {
-                av_usleep(DTLS_SSL_TIMER_BASE + ctx->dtls_arq_timeout * 1000);
+                //av_usleep(DTLS_SSL_TIMER_BASE + ctx->dtls_arq_timeout * 1000);
                 continue; /* no timeout had expired. */
             }
             if (r0 != 1) {
@@ -639,10 +691,19 @@ static int openssl_drive_context(DTLSContext *ctx, SSL *dtls, BIO *bio_in, BIO *
                 return AVERROR(EIO);
             }
 
+            av_usleep(30 * 1000);
             ctx->dtls_arq_packets++;
             break;
         }
     }
+
+    /* Ignore EAGAIN if already done */
+    if (ret == AVERROR(EAGAIN) && ctx->dtls_done_for_us)
+        ret = 0;
+
+    /* Ignore if no data to feed */
+    if (!res_size)
+        return ret;
 
     /* Trace the response packet, feed to SSL. */
     BIO_reset(bio_in);
@@ -680,7 +741,7 @@ static int dtls_context_handshake(DTLSContext *ctx)
 #if OPENSSL_VERSION_NUMBER < 0x10002000L /* OpenSSL v1.0.2 */
     dtls_ctx = SSL_CTX_new(DTLSv1_method());
 #else
-    dtls_ctx = SSL_CTX_new(DTLS_client_method());
+    dtls_ctx = SSL_CTX_new(DTLS_server_method());
 #endif
     if (!dtls_ctx) {
         ret = AVERROR(ENOMEM);
@@ -717,6 +778,7 @@ static int dtls_context_handshake(DTLSContext *ctx)
         ret = AVERROR(ENOMEM);
         goto end;
     }
+    BIO_ctrl(bio_out, BIO_CTRL_DGRAM_SET_MTU, 0, NULL);
 
     SSL_set_bio(dtls, bio_in, bio_out);
 
@@ -726,8 +788,11 @@ static int dtls_context_handshake(DTLSContext *ctx)
         goto end;
     }
 
+    printf("Start to drive context\n");
     for (loop = 0; loop < 64 && !ctx->dtls_done_for_us; loop++) {
+        printf("Before drive context, ipad=%d, opad=%d\n", BIO_ctrl_pending(bio_in), BIO_ctrl_pending(bio_out));
         ret = openssl_drive_context(ctx, dtls, bio_in, bio_out, loop);
+        printf("After drive context, ipad=%d, opad=%d\n", BIO_ctrl_pending(bio_in), BIO_ctrl_pending(bio_out));
         if (ret < 0) {
             av_log(s1, AV_LOG_ERROR, "Failed to drive SSL context, cost=%dms\n",
                 (int)(av_gettime() - starttime) / 1000);
@@ -1124,7 +1189,7 @@ static int generate_sdp_offer(AVFormatContext *s)
             "a=ice-ufrag:%s\r\n"
             "a=ice-pwd:%s\r\n"
             "a=fingerprint:sha-256 %s\r\n"
-            "a=setup:active\r\n"
+            "a=setup:passive\r\n"
             "a=mid:0\r\n"
             "a=sendonly\r\n"
             "a=msid:FFmpeg audio\r\n"
@@ -1158,7 +1223,7 @@ static int generate_sdp_offer(AVFormatContext *s)
             "a=ice-ufrag:%s\r\n"
             "a=ice-pwd:%s\r\n"
             "a=fingerprint:sha-256 %s\r\n"
-            "a=setup:active\r\n"
+            "a=setup:passive\r\n"
             "a=mid:1\r\n"
             "a=sendonly\r\n"
             "a=msid:FFmpeg video\r\n"
@@ -1660,6 +1725,7 @@ static int ice_handshake(AVFormatContext *s)
     /* Fast retransmit the STUN binding request. */
     while (1) {
         ret = ffurl_write(rtc->udp_uc, req_buf, size);
+        //printf("time ice-write=%llu, cost=%dms\n", av_gettime_relative()/1000, (av_gettime_relative()-cur_time)/1000); cur_time = av_gettime_relative();
         if (ret < 0) {
             av_log(s, AV_LOG_ERROR, "Failed to send STUN binding request, size=%d\n", size);
             goto end;
@@ -1667,15 +1733,18 @@ static int ice_handshake(AVFormatContext *s)
 
         /* Wait so that the server can process the request and no need ARQ then. */
 #if ICE_PROCESSING_TIMEOUT > 0
-        av_usleep(ICE_PROCESSING_TIMEOUT * 10000);
+        //av_usleep(ICE_PROCESSING_TIMEOUT * 1000);
+        av_usleep(1 * 1000);
 #endif
 
         /* Read the STUN binding response. */
         ret = ffurl_read(rtc->udp_uc, res_buf, sizeof(res_buf));
+        //printf("time ice-read=%llu, cost=%dms\n", av_gettime_relative()/1000, (av_gettime_relative()-cur_time)/1000); cur_time = av_gettime_relative();
         if (ret < 0) {
             /* If max retries is 6 and start timeout is 21ms, the total timeout
              * is about 21 + 42 + 84 + 168 + 336 + 672 = 1263ms. */
-            av_usleep(timeout * 1000);
+            //av_usleep(timeout * 1000);
+            av_usleep(1 * 1000);
             timeout *= 2;
 
             if (ret == AVERROR(EAGAIN) && fast_retries) {
@@ -1683,6 +1752,7 @@ static int ice_handshake(AVFormatContext *s)
                 continue;
             }
 
+            ret = 0;
             av_log(s, AV_LOG_ERROR, "Failed to read STUN binding response, retries=%d\n", rtc->ice_arq_max);
             goto end;
         }
@@ -1699,12 +1769,14 @@ static int ice_handshake(AVFormatContext *s)
     /* Wait just for a small while to get the possible binding request from server. */
     fast_retries = rtc->ice_arq_max / 2;
     timeout = rtc->ice_arq_timeout;
-    while (fast_retries) {
+    while (0 && fast_retries) {
         ret = ffurl_read(rtc->udp_uc, res_buf, sizeof(res_buf));
+        //printf("time ice-read2=%llu, cost=%dms\n", av_gettime_relative()/1000, (av_gettime_relative()-cur_time)/1000); cur_time = av_gettime_relative();
         if (ret < 0) {
             /* If max retries is 6 and start timeout is 21ms, the total timeout
              * is about 21 + 42 + 84 = 147ms. */
-            av_usleep(timeout * 1000);
+            //av_usleep(timeout * 1000);
+            av_usleep(5 * 1000);
             timeout *= 2;
 
             if (ret == AVERROR(EAGAIN)) {
@@ -1720,8 +1792,8 @@ static int ice_handshake(AVFormatContext *s)
         if (ice_is_binding_request(res_buf, ret)) {
             if ((ret = ice_handle_binding_request(s, res_buf, ret)) < 0)
                 goto end;
-            break;
         }
+        break;
     }
 
     av_log(s, AV_LOG_INFO, "WHIP: ICE STUN ok, url=udp://%s:%d, location=%s, username=%s:%s, req=%dB, res=%dB, arq=%d\n",
@@ -1752,12 +1824,20 @@ static int setup_srtp(AVFormatContext *s)
     RTCContext *rtc = s->priv_data;
 
     /* As DTLS client, the send key is client master key plus salt. */
-    memcpy(send_key, rtc->dtls_ctx.dtls_srtp_material, 16);
-    memcpy(send_key + 16, rtc->dtls_ctx.dtls_srtp_material + 32, 14);
+    //memcpy(send_key, rtc->dtls_ctx.dtls_srtp_material, 16);
+    //memcpy(send_key + 16, rtc->dtls_ctx.dtls_srtp_material + 32, 14);
 
     /* As DTLS client, the recv key is server master key plus salt. */
-    memcpy(recv_key, rtc->dtls_ctx.dtls_srtp_material + 16, 16);
-    memcpy(recv_key + 16, rtc->dtls_ctx.dtls_srtp_material + 46, 14);
+    //memcpy(recv_key, rtc->dtls_ctx.dtls_srtp_material + 16, 16);
+    //memcpy(recv_key + 16, rtc->dtls_ctx.dtls_srtp_material + 46, 14);
+
+    /* As DTLS server, the recv key is client master key plus salt. */
+    memcpy(recv_key, rtc->dtls_ctx.dtls_srtp_material, 16);
+    memcpy(recv_key + 16, rtc->dtls_ctx.dtls_srtp_material + 32, 14);
+
+    /* As DTLS server, the send key is server master key plus salt. */
+    memcpy(send_key, rtc->dtls_ctx.dtls_srtp_material + 16, 16);
+    memcpy(send_key + 16, rtc->dtls_ctx.dtls_srtp_material + 46, 14);
 
     /* Setup SRTP context for outgoing packets */
     if (!av_base64_encode(buf, sizeof(buf), send_key, sizeof(send_key))) {
@@ -2092,6 +2172,8 @@ static av_cold int rtc_init(AVFormatContext *s)
     int ret;
     RTCContext *rtc = s->priv_data;
 
+    printf("time start=%llu\n", av_gettime_relative()/1000); cur_time = av_gettime_relative();
+
     if ((ret = whip_init(s)) < 0)
         return ret;
 
@@ -2107,15 +2189,18 @@ static av_cold int rtc_init(AVFormatContext *s)
     if ((ret = parse_answer(s)) < 0)
         return ret;
 
+    printf("time ice-before=%llu, cost=%dms\n", av_gettime_relative()/1000, (av_gettime_relative()-cur_time)/1000); cur_time = av_gettime_relative();
     if ((ret = ice_handshake(s)) < 0)
         return ret;
 
     /* Now UDP URL context is ready, setup the DTLS transport. */
     rtc->dtls_ctx.udp_uc = rtc->udp_uc;
 
+    printf("time dtls-before=%llu, cost=%dms\n", av_gettime_relative()/1000, (av_gettime_relative()-cur_time)/1000); cur_time = av_gettime_relative();
     if ((ret = dtls_context_handshake(&rtc->dtls_ctx)) < 0)
         return ret;
 
+    printf("time srtp-before=%llu, cost=%dms\n", av_gettime_relative()/1000, (av_gettime_relative()-cur_time)/1000); cur_time = av_gettime_relative();
     if ((ret = setup_srtp(s)) < 0)
         return ret;
 
@@ -2209,7 +2294,7 @@ static av_cold void rtc_deinit(AVFormatContext *s)
 static const AVOption options[] = {
     { "ice_arq_max",        "Maximum number of retransmissions for the ICE ARQ mechanism",      OFFSET(ice_arq_max),        AV_OPT_TYPE_INT,    { .i64 = 5 },       -1, INT_MAX, DEC },
     { "ice_arq_timeout",    "Start timeout in milliseconds for the ICE ARQ mechanism",          OFFSET(ice_arq_timeout),    AV_OPT_TYPE_INT,    { .i64 = 30 },      -1, INT_MAX, DEC },
-    { "dtls_arq_max",       "Maximum number of retransmissions for the DTLS ARQ mechanism",     OFFSET(dtls_arq_max),       AV_OPT_TYPE_INT,    { .i64 = 5 },       -1, INT_MAX, DEC },
+    { "dtls_arq_max",       "Maximum number of retransmissions for the DTLS ARQ mechanism",     OFFSET(dtls_arq_max),       AV_OPT_TYPE_INT,    { .i64 = 15 },       -1, INT_MAX, DEC },
     { "dtls_arq_timeout",   "Start timeout in milliseconds for the DTLS ARQ mechanism",         OFFSET(dtls_arq_timeout),   AV_OPT_TYPE_INT,    { .i64 = 50 },      -1, INT_MAX, DEC },
     { "pkt_size",           "The maximum size, in bytes, of RTP packets that send out",         OFFSET(pkt_size),           AV_OPT_TYPE_INT,    { .i64 = 1200 },    -1, INT_MAX, DEC },
     { "authorization",      "The optional Bearer token for WHIP Authorization",                 OFFSET(authorization),      AV_OPT_TYPE_STRING, { .str = NULL },     0,       0, DEC },
