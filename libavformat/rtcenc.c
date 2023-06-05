@@ -72,19 +72,7 @@
  * but please keep in mind that the `pkt_size` option limits the packet size to 1400.
  */
 #define MAX_UDP_BUFFER_SIZE 4096
-/*
- * Supported DTLS cipher suites for FFmpeg as a DTLS client.
- * These cipher suites are used to negotiate with DTLS servers.
- *
- * It is advisable to use a limited number of cipher suites to reduce
- * the size of DTLS UDP packets.
- */
-#define DTLS_CIPHER_SUTES "ECDHE-ECDSA-AES128-GCM-SHA256"\
-    ":ECDHE-RSA-AES128-GCM-SHA256"\
-    ":ECDHE-ECDSA-AES128-SHA"\
-    ":ECDHE-RSA-AES128-SHA"\
-    ":ECDHE-ECDSA-AES256-SHA"\
-    ":ECDHE-RSA-AES256-SHA"
+
 /**
  * The size of the Secure Real-time Transport Protocol (SRTP) master key material
  * that is exported by Secure Sockets Layer (SSL) after a successful Datagram
@@ -410,8 +398,14 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
     }
 #endif
 
-    /* We use "ALL", while you can use "DEFAULT" means "ALL:!EXPORT:!LOW:!aNULL:!eNULL:!SSLv2" */
-    if (SSL_CTX_set_cipher_list(dtls_ctx, DTLS_CIPHER_SUTES) != 1) {
+    /**
+     * We use "ALL", while you can use "DEFAULT" means "ALL:!EXPORT:!LOW:!aNULL:!eNULL:!SSLv2"
+     *      Cipher Suite: ECDHE-ECDSA-AES128-CBC-SHA (0xc009)
+     *      Cipher Suite: ECDHE-RSA-AES128-CBC-SHA (0xc013)
+     *      Cipher Suite: ECDHE-ECDSA-AES256-CBC-SHA (0xc00a)
+     *      Cipher Suite: ECDHE-RSA-AES256-CBC-SHA (0xc014)
+     */
+    if (SSL_CTX_set_cipher_list(dtls_ctx, "ALL") != 1) {
         av_log(s1, AV_LOG_ERROR, "DTLS: SSL_CTX_set_cipher_list failed\n");
         return AVERROR(EINVAL);
     }
