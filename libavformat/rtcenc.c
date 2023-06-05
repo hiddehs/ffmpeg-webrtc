@@ -171,11 +171,18 @@ typedef struct DTLSContext {
     uint8_t dtls_srtp_material[DTLS_SRTP_MASTER_KEY_LEN * 2];
 
     /* Whether the timer should be reset. */
+    // TODO: FIXME: Remove it.
     int dtls_should_reset_timer;
     /* Whether the DTLS is done at least for us. */
     int dtls_done_for_us;
     /* The number of packets retransmitted for DTLS. */
     int dtls_arq_packets;
+    /**
+     * This is the last DTLS content type and handshake type that is used to detect
+     * the ARQ packet.
+     */
+    uint8_t dtls_last_content_type;
+    uint8_t dtls_last_handshake_type;
 
     /* The UDP transport is used for delivering ICE, DTLS and SRTP packets. */
     URLContext *udp_uc;
@@ -456,7 +463,7 @@ static unsigned int openssl_dtls_timer_cb(SSL *dtls, unsigned int previous_us)
 }
 #endif
 
-static void openssl_state_trace(DTLSContext *ctx, uint8_t *data, int length, int incoming, int r0, int r1)
+static void openssl_state_trace(DTLSContext *ctx, uint8_t *data, int length, int incoming)
 {
     uint8_t content_type = 0;
     uint16_t size = 0;
@@ -471,9 +478,18 @@ static void openssl_state_trace(DTLSContext *ctx, uint8_t *data, int length, int
     if (length >= 14)
         handshake_type = (uint8_t)data[13];
 
-    av_log(s1, AV_LOG_VERBOSE, "WHIP: DTLS state %s %s, done=%u, arq=%u, r0=%d, r1=%d, len=%u, cnt=%u, size=%u, hs=%u\n",
-        "Active", (incoming? "RECV":"SEND"), ctx->dtls_done_for_us, ctx->dtls_arq_packets, r0, r1, length,
+    av_log(s1, AV_LOG_VERBOSE, "WHIP: DTLS state %s %s, done=%u, arq=%u, len=%u, cnt=%u, size=%u, hs=%u\n",
+        "Active", (incoming? "RECV":"SEND"), ctx->dtls_done_for_us, ctx->dtls_arq_packets, length,
         content_type, size, handshake_type);
+}
+
+/**
+ * Always OK, we don't check the certificate of client,
+ * because we allow client self-sign certificate.
+ */
+static int openssl_verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
+{
+    return 1;
 }
 
 /**
@@ -512,6 +528,9 @@ static av_cold int openssl_init_dtls_context(DTLSContext *ctx, SSL_CTX *dtls_ctx
         ret = AVERROR(EINVAL);
         goto end;
     }
+
+    /* Server will send Certificate Request. */
+    SSL_CTX_set_verify(dtls_ctx, SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE, openssl_verify_callback);
     /* The depth count is "level 0:peer certificate", "level 1: CA certificate",
      * "level 2: higher level CA certificate", and so on. */
     SSL_CTX_set_verify_depth(dtls_ctx, 4);
@@ -529,137 +548,41 @@ end:
 }
 
 /**
- * After creating a DTLS context, initialize the DTLS SSL object.
+ * DTLS BIO read callback.
  */
-static av_cold int openssl_init_dtls_ssl(DTLSContext *ctx, SSL *dtls)
+static long openssl_dtls_bio_out_callback(BIO* b, int oper, const char* argp, int argi, long argl, long retvalue)
 {
-    int ret = 0;
+    int ret, req_size = argi, is_arq = 0;
+    uint8_t content_type, handshake_type;
+    uint8_t *data = (uint8_t*)argp;
+    long r0 = (BIO_CB_RETURN & oper) ? retvalue : 1;
+    DTLSContext* ctx = b ? (DTLSContext*)BIO_get_callback_arg(b) : NULL;
+    void *s1 = ctx ? ctx->log_avcl : NULL;
 
-    /* Setup the callback for logging. */
-    SSL_set_ex_data(dtls, 0, ctx);
-    SSL_set_info_callback(dtls, openssl_on_info);
+    if (oper != BIO_CB_WRITE || !argp || argi <= 0)
+        return r0;
 
-    /* Set dtls fragment size */
-    SSL_set_options(dtls, SSL_OP_NO_QUERY_MTU);
-    /* Avoid dtls negotiate failed, limit the max size of DTLS fragment. */
-    SSL_set_mtu(dtls, ctx->pkt_size);
+    openssl_state_trace(ctx, data, req_size, 0);
+    ret = ffurl_write(ctx->udp_uc, argp, argi);
+    content_type = req_size > 0 ? data[0] : 0;
+    handshake_type = req_size > 13 ? data[13] : 0;
 
-#if OPENSSL_VERSION_NUMBER >= 0x10101000L /* OpenSSL 1.1.1 */
-    /* Set the callback for ARQ timer. */
-    DTLS_set_timer_cb(dtls, openssl_dtls_timer_cb);
-#endif
+    is_arq = ctx->dtls_last_content_type == content_type && ctx->dtls_last_handshake_type == handshake_type;
+    ctx->dtls_arq_packets += is_arq;
+    ctx->dtls_last_content_type = content_type;
+    ctx->dtls_last_handshake_type = handshake_type;
 
-    /* Setup DTLS as active, which is client role. */
-    SSL_set_connect_state(dtls);
-    SSL_set_max_send_fragment(dtls, ctx->pkt_size);
+    if (ret < 0) {
+        av_log(s1, AV_LOG_ERROR, "DTLS: Send request failed, oper=%d, content=%d, handshake=%d, size=%d, is_arq=%d\n",
+            oper, content_type, handshake_type, req_size, is_arq);
+        return ret;
+    }
 
-    return ret;
+    return r0;
 }
 
 /**
- * Drives the SSL context by attempting to read packets to send from SSL, sending them
- * over UDP, and then reading packets from UDP to feed back to SSL.
- */
-static int openssl_drive_context(DTLSContext *ctx, SSL *dtls, BIO *bio_in, BIO *bio_out, int loop)
-{
-    int ret, i, j, r0, r1, req_size, res_size = 0;
-    uint8_t *data = NULL, req_ct = 0, req_ht = 0, res_ct = 0, res_ht = 0;
-    char buf[MAX_UDP_BUFFER_SIZE];
-    void *s1 = ctx->log_avcl;
-
-    /* Drive the SSL context by state change, arq or response messages. */
-    r0 = SSL_do_handshake(dtls);
-    r1 = SSL_get_error(dtls, r0);
-
-    /* Handshake successfully done */
-    if (r0 == 1) {
-        ctx->dtls_done_for_us = 1;
-        return 0;
-    }
-
-    /* Handshake failed with fatal error */
-    if (r0 < 0 && r1 != SSL_ERROR_WANT_READ) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: Start handshake failed, loop=%d, r0=%d, r1=%d\n", loop, r0, r1);
-        return AVERROR(EIO);
-    }
-
-    /* Fast retransmit the request util got response. */
-    for (i = 0; i <= ctx->dtls_arq_max && !res_size; i++) {
-        req_size = BIO_get_mem_data(bio_out, (char**)&data);
-        openssl_state_trace(ctx, data, req_size, 0, r0, r1);
-        ret = ffurl_write(ctx->udp_uc, data, req_size);
-        BIO_reset(bio_out);
-        req_ct = req_size > 0 ? data[0] : 0;
-        req_ht = req_size > 13 ? data[13] : 0;
-        if (ret < 0) {
-            av_log(s1, AV_LOG_ERROR, "DTLS: Send request failed, loop=%d, content=%d, handshake=%d, size=%d\n",
-                loop, req_ct, req_ht, req_size);
-            return ret;
-        }
-
-        /* Wait so that the server can process the request and no need ARQ then. */
-#if DTLS_PROCESSING_TIMEOUT > 0
-        av_usleep(DTLS_PROCESSING_TIMEOUT * 10000);
-#endif
-
-        for (j = 0; j <= DTLS_EAGAIN_RETRIES_MAX && !res_size; j++) {
-            ret = ffurl_read(ctx->udp_uc, buf, sizeof(buf));
-
-            /* Ignore other packets, such as ICE indication, except DTLS. */
-            if (ret > 0 && (ret < 13 || buf[0] <= 19 || buf[0] >= 64))
-                continue;
-
-            /* Got DTLS response successfully. */
-            if (ret > 0) {
-                res_size = ret;
-                ctx->dtls_should_reset_timer = 1;
-                break;
-            }
-
-            /* Fatal error or timeout. */
-            if (ret != AVERROR(EAGAIN)) {
-                av_log(s1, AV_LOG_ERROR, "DTLS: Read response failed, loop=%d, content=%d, handshake=%d\n",
-                    loop, req_ct, req_ht);
-                return ret;
-            }
-
-            /* DTLSv1_handle_timeout is called when a DTLS handshake timeout expires. If no timeout
-             * had expired, it returns 0. Otherwise, it retransmits the previous flight of handshake
-             * messages and returns 1. If too many timeouts had expired without progress or an error
-             * occurs, it returns -1. */
-            r0 = DTLSv1_handle_timeout(dtls);
-            if (!r0) {
-                av_usleep(DTLS_SSL_TIMER_BASE + ctx->dtls_arq_timeout * 1000);
-                continue; /* no timeout had expired. */
-            }
-            if (r0 != 1) {
-                r1 = SSL_get_error(dtls, r0);
-                av_log(s1, AV_LOG_ERROR, "DTLS: Handle timeout, loop=%d, content=%d, handshake=%d, r0=%d, r1=%d\n",
-                    loop, req_ct, req_ht, r0, r1);
-                return AVERROR(EIO);
-            }
-
-            ctx->dtls_arq_packets++;
-            break;
-        }
-    }
-
-    /* Trace the response packet, feed to SSL. */
-    BIO_reset(bio_in);
-    openssl_state_trace(ctx, buf, res_size, 1, r0, SSL_ERROR_NONE);
-    res_ct = res_size > 0 ? buf[0]: 0;
-    res_ht = res_size > 13 ? buf[13] : 0;
-    if ((r0 = BIO_write(bio_in, buf, res_size)) <= 0) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: Feed response failed, loop=%d, content=%d, handshake=%d, size=%d, r0=%d\n",
-            loop, res_ct, res_ht, res_size, r0);
-        return AVERROR(EIO);
-    }
-
-    return ret;
-}
-
-/**
- * DTLS handshake with server, as a client in active mode, using openssl.
+ * DTLS handshake with server, as a server in passive mode, using openssl.
  *
  * This function initializes the SSL context as the client role using OpenSSL and
  * then performs the DTLS handshake until success. Upon successful completion, it
@@ -669,18 +592,19 @@ static int openssl_drive_context(DTLSContext *ctx, SSL *dtls, BIO *bio_in, BIO *
  */
 static int dtls_context_handshake(DTLSContext *ctx)
 {
-    int ret, loop;
+    int ret, loop, res_ct, res_ht, r0, r1;
     SSL_CTX *dtls_ctx = NULL;
     SSL *dtls = NULL;
     const char* dst = "EXTRACTOR-dtls_srtp";
     BIO *bio_in = NULL, *bio_out = NULL;
     int64_t starttime = av_gettime();
     void *s1 = ctx->log_avcl;
+    char buf[MAX_UDP_BUFFER_SIZE];
 
 #if OPENSSL_VERSION_NUMBER < 0x10002000L /* OpenSSL v1.0.2 */
     dtls_ctx = SSL_CTX_new(DTLSv1_method());
 #else
-    dtls_ctx = SSL_CTX_new(DTLS_client_method());
+    dtls_ctx = SSL_CTX_new(DTLS_method());
 #endif
     if (!dtls_ctx) {
         ret = AVERROR(ENOMEM);
@@ -706,6 +630,23 @@ static int dtls_context_handshake(DTLSContext *ctx)
         goto end;
     }
 
+    /* Setup the callback for logging. */
+    SSL_set_ex_data(dtls, 0, ctx);
+    SSL_set_info_callback(dtls, openssl_on_info);
+
+    /**
+     * We have set the MTU to fragment the DTLS packet. It is important to note that the
+     * packet is split to ensure that each handshake packet is smaller than the MTU.
+     */
+    SSL_set_options(dtls, SSL_OP_NO_QUERY_MTU);
+    SSL_set_mtu(dtls, ctx->pkt_size);
+    DTLS_set_link_mtu(dtls, ctx->pkt_size);
+
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L /* OpenSSL 1.1.1 */
+    /* Set the callback for ARQ timer. */
+    DTLS_set_timer_cb(dtls, openssl_dtls_timer_cb);
+#endif
+
     bio_in = BIO_new(BIO_s_mem());
     if (!bio_in) {
         ret = AVERROR(ENOMEM);
@@ -718,22 +659,98 @@ static int dtls_context_handshake(DTLSContext *ctx)
         goto end;
     }
 
+    /**
+     * Please be aware that it is necessary to use a callback to obtain the packet to be written out. It is
+     * imperative that BIO_get_mem_data is not used to retrieve the packet, as it returns all the bytes that
+     * need to be sent out.
+     * For example, if MTU is set to 1200, and we got two DTLS packets to sendout:
+     *      ServerHello, 95bytes.
+     *      Certificate, 1105+143=1248bytes.
+     * If use BIO_get_mem_data, it will return 95+1248=1343bytes, which is larger than MTU 1200.
+     * If use callback, it will return two UDP packets:
+     *      ServerHello+Certificate(Frament) = 95+1105=1200bytes.
+     *      Certificate(Fragment) = 143bytes.
+     * Note that there should be more packets in real world, like ServerKeyExchange, CertificateRequest,
+     * and ServerHelloDone. Here we just use two packets for example.
+     */
+    BIO_set_callback(bio_out, openssl_dtls_bio_out_callback);
+    BIO_set_callback_arg(bio_out, (char*)ctx);
+
     SSL_set_bio(dtls, bio_in, bio_out);
 
-    ret = openssl_init_dtls_ssl(ctx, dtls);
-    if (ret < 0) {
-        av_log(s1, AV_LOG_ERROR, "Failed to initialize SSL context\n");
+    /* Setup DTLS as passive, which is server role. */
+    SSL_set_accept_state(dtls);
+
+    /**
+     * During initialization, we only need to call SSL_do_handshake once because SSL_read consumes
+     * the handshake message if the handshake is incomplete.
+     * To simplify maintenance, we initiate the handshake for both the DTLS server and client after
+     * sending out the ICE response in the start_active_handshake function. It's worth noting that
+     * although the DTLS server may receive the ClientHello immediately after sending out the ICE
+     * response, this shouldn't be an issue as the handshake function is called before any DTLS
+     * packets are received.
+     */
+    r0 = SSL_do_handshake(dtls);
+    r1 = SSL_get_error(dtls, r0); ERR_clear_error();
+    // Fatal SSL error, for example, no available suite when peer is DTLS 1.0 while we are DTLS 1.2.
+    if (r0 < 0 && (r1 != SSL_ERROR_NONE && r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE)) {
+        av_log(s1, AV_LOG_ERROR, "Failed to drive SSL context, cost=%dms\n",
+            (int)(av_gettime() - starttime) / 1000);
         goto end;
     }
 
-    for (loop = 0; loop < 64 && !ctx->dtls_done_for_us; loop++) {
-        ret = openssl_drive_context(ctx, dtls, bio_in, bio_out, loop);
-        if (ret < 0) {
-            av_log(s1, AV_LOG_ERROR, "Failed to drive SSL context, cost=%dms\n",
-                (int)(av_gettime() - starttime) / 1000);
+    /* Receive DTLS message from peer and drive the DTLS context. */
+    for (loop = 0; loop < DTLS_EAGAIN_RETRIES_MAX && !ctx->dtls_done_for_us;) {
+        ret = ffurl_read(ctx->udp_uc, buf, sizeof(buf));
+
+        /* Ignore other packets, such as ICE indication, except DTLS. */
+        if (ret > 0 && (ret < 13 || buf[0] <= 19 || buf[0] >= 64))
+            continue;
+
+        /* Fatal error or timeout. */
+        if (ret <= 0) {
+            if (ret == AVERROR(EAGAIN)) {
+                loop++;
+                av_usleep(30 * 1000);
+                continue;
+            }
+            av_log(s1, AV_LOG_ERROR, "DTLS: Read response failed, loop=%d\n", loop);
             goto end;
         }
+
+        /* Got DTLS response successfully. */
+        openssl_state_trace(ctx, buf, ret, 1);
+        if ((r0 = BIO_write(bio_in, buf, ret)) <= 0) {
+            res_ct = ret > 0 ? buf[0]: 0;
+            res_ht = ret > 13 ? buf[13] : 0;
+            av_log(s1, AV_LOG_ERROR, "DTLS: Feed response failed, loop=%d, content=%d, handshake=%d, size=%d, r0=%d\n",
+                loop, res_ct, res_ht, ret, r0);
+            ret = AVERROR(EIO);
+            goto end;
+        }
+
+        /**
+         * If there is data available in bio_in, use SSL_read to allow SSL to process it.
+         * We limit the MTU to 1200 for DTLS handshake, which ensures that the buffer is large enough for reading.
+         */
+        r0 = SSL_read(dtls, buf, sizeof(buf));
+        r1 = SSL_get_error(dtls, r0); ERR_clear_error();
+        if (r0 <= 0) {
+            if (r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE && r1 != SSL_ERROR_ZERO_RETURN) {
+                av_log(s1, AV_LOG_ERROR, "DTLS: Read failed, loop=%d, r0=%d, r1=%d\n", loop, r0, r1);
+                ret = AVERROR(EIO);
+                goto end;
+            }
+        } else {
+            av_log(s1, AV_LOG_TRACE, "DTLS: Read %d bytes, loop=%d, r0=%d, r1=%d\n", r0, loop, r0, r1);
+        }
+
+        // Check whether the DTLS is completed.
+        if (!ctx->dtls_done_for_us && SSL_is_init_finished(dtls) == 1) {
+            ctx->dtls_done_for_us = 1;
+        }
     }
+
     if (!ctx->dtls_done_for_us) {
         av_log(s1, AV_LOG_ERROR, "DTLS: Handshake failed, loop=%d\n", loop);
         ret = AVERROR(EIO);
@@ -1124,7 +1141,7 @@ static int generate_sdp_offer(AVFormatContext *s)
             "a=ice-ufrag:%s\r\n"
             "a=ice-pwd:%s\r\n"
             "a=fingerprint:sha-256 %s\r\n"
-            "a=setup:active\r\n"
+            "a=setup:passive\r\n"
             "a=mid:0\r\n"
             "a=sendonly\r\n"
             "a=msid:FFmpeg audio\r\n"
@@ -1158,7 +1175,7 @@ static int generate_sdp_offer(AVFormatContext *s)
             "a=ice-ufrag:%s\r\n"
             "a=ice-pwd:%s\r\n"
             "a=fingerprint:sha-256 %s\r\n"
-            "a=setup:active\r\n"
+            "a=setup:passive\r\n"
             "a=mid:1\r\n"
             "a=sendonly\r\n"
             "a=msid:FFmpeg video\r\n"
