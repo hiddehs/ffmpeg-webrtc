@@ -151,6 +151,8 @@ typedef struct DTLSContext {
 
     /* The private key for DTLS handshake. */
     EVP_PKEY *dtls_pkey;
+    /* The EC key for DTLS handshake. */
+    EC_KEY* dtls_eckey;
     /* The SSL certificate used for fingerprint in SDP and DTLS handshake. */
     X509 *dtls_cert;
     /* The fingerprint of certificate, used in SDP offer. */
@@ -194,7 +196,6 @@ static int openssl_dtls_gen_private_key(DTLSContext *ctx)
     int ret = 0;
 #if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
     EC_GROUP *ecgroup = NULL;
-    EC_KEY* dtls_eckey = NULL;
 #else
     const char *curve = "prime256v1";
 #endif
@@ -209,7 +210,7 @@ static int openssl_dtls_gen_private_key(DTLSContext *ctx)
      */
 #if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
     ctx->dtls_pkey = EVP_PKEY_new();
-    dtls_eckey = EC_KEY_new();
+    ctx->dtls_eckey = EC_KEY_new();
     ecgroup = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
 
 #if OPENSSL_VERSION_NUMBER < 0x10100000L // v1.1.x
@@ -217,19 +218,19 @@ static int openssl_dtls_gen_private_key(DTLSContext *ctx)
     EC_GROUP_set_asn1_flag(ecgroup, OPENSSL_EC_NAMED_CURVE);
 #endif
 
-    if (EC_KEY_set_group(dtls_eckey, ecgroup) != 1) {
+    if (EC_KEY_set_group(ctx->dtls_eckey, ecgroup) != 1) {
         av_log(s1, AV_LOG_ERROR, "DTLS: EC_KEY_set_group failed\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
-    if (EC_KEY_generate_key(dtls_eckey) != 1) {
+    if (EC_KEY_generate_key(ctx->dtls_eckey) != 1) {
         av_log(s1, AV_LOG_ERROR, "DTLS: EC_KEY_generate_key failed\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
-    if (EVP_PKEY_set1_EC_KEY(ctx->dtls_pkey, dtls_eckey) != 1) {
+    if (EVP_PKEY_set1_EC_KEY(ctx->dtls_pkey, ctx->dtls_eckey) != 1) {
         av_log(s1, AV_LOG_ERROR, "DTLS: EVP_PKEY_set1_EC_KEY failed\n");
         ret = AVERROR(EINVAL);
         goto end;
@@ -245,7 +246,6 @@ static int openssl_dtls_gen_private_key(DTLSContext *ctx)
 
 end:
 #if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
-    EC_KEY_free(dtls_eckey);
     EC_GROUP_free(ecgroup);
 #endif
     return ret;
@@ -398,6 +398,14 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
     }
 #endif
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L // v1.1.x
+#if OPENSSL_VERSION_NUMBER < 0x10002000L // v1.0.2
+    SSL_CTX_set_tmp_ecdh(dtls_ctx, ctx->dtls_eckey);
+#else
+    SSL_CTX_set_ecdh_auto(dtls_ctx, 1);
+#endif
+#endif
+
     /**
      * We use "ALL", while you can use "DEFAULT" means "ALL:!EXPORT:!LOW:!aNULL:!eNULL:!SSLv2"
      *      Cipher Suite: ECDHE-ECDSA-AES128-CBC-SHA (0xc009)
@@ -483,7 +491,9 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
 }
 
 /**
- * Generate a self-signed certificate and private key for DTLS.
+ * Generate a self-signed certificate and private key for DTLS. Please note that the
+ * ff_openssl_init in tls_openssl.c has already called SSL_library_init(), and therefore,
+ * there is no need to call it again.
  */
 static av_cold int dtls_context_init(DTLSContext *ctx)
 {
@@ -493,23 +503,22 @@ static av_cold int dtls_context_init(DTLSContext *ctx)
     /* Generate a private key to ctx->dtls_pkey. */
     if ((ret = openssl_dtls_gen_private_key(ctx)) < 0) {
         av_log(s1, AV_LOG_ERROR, "Failed to generate DTLS private key\n");
-        goto end;
+        return ret;
     }
 
     /* Generate a self-signed certificate. */
     if ((ret = openssl_dtls_gen_certificate(ctx)) < 0) {
         av_log(s1, AV_LOG_ERROR, "Failed to generate DTLS certificate\n");
-        goto end;
+        return ret;
     }
 
     if ((ret = openssl_dtls_init_context(ctx)) < 0) {
         av_log(s1, AV_LOG_ERROR, "Failed to initialize DTLS context\n");
-        goto end;
+        return ret;
     }
 
     av_log(s1, AV_LOG_INFO, "DTLS: Setup ok, MTU=%d, fingerprint %s\n", ctx->pkt_size, ctx->dtls_fingerprint);
 
-end:
     return ret;
 }
 
@@ -523,6 +532,9 @@ static av_cold void dtls_context_deinit(DTLSContext *ctx)
     X509_free(ctx->dtls_cert);
     EVP_PKEY_free(ctx->dtls_pkey);
     av_freep(&ctx->dtls_fingerprint);
+#if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
+    EC_KEY_free(ctx->dtls_eckey);
+#endif
 }
 
 /**
