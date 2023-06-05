@@ -198,7 +198,7 @@ typedef struct DTLSContext {
     int pkt_size;
 } DTLSContext;
 
-static int openssl_gen_private_key(DTLSContext *ctx)
+static int openssl_dtls_gen_private_key(DTLSContext *ctx)
 {
     int ret = 0;
 #if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
@@ -283,7 +283,7 @@ static av_cold int dtls_context_init(DTLSContext *ctx)
     }
 
     /* Generate a private key to ctx->dtls_pkey. */
-    if ((ret = openssl_gen_private_key(ctx)) < 0)
+    if ((ret = openssl_dtls_gen_private_key(ctx)) < 0)
         goto end;
 
     /* Generate a self-signed certificate. */
@@ -396,7 +396,7 @@ static av_cold void dtls_context_deinit(DTLSContext *ctx)
 /**
  * Callback function to print the OpenSSL SSL status.
  */
-static void openssl_on_info(const SSL *dtls, int where, int ret)
+static void openssl_dtls_on_info(const SSL *dtls, int where, int ret)
 {
     int w, r1;
     const char *method = "undefined", *alert_type, *alert_desc;
@@ -463,7 +463,7 @@ static unsigned int openssl_dtls_timer_cb(SSL *dtls, unsigned int previous_us)
 }
 #endif
 
-static void openssl_state_trace(DTLSContext *ctx, uint8_t *data, int length, int incoming)
+static void openssl_dtls_state_trace(DTLSContext *ctx, uint8_t *data, int length, int incoming)
 {
     uint8_t content_type = 0;
     uint16_t size = 0;
@@ -484,10 +484,10 @@ static void openssl_state_trace(DTLSContext *ctx, uint8_t *data, int length, int
 }
 
 /**
- * Always OK, we don't check the certificate of client,
- * because we allow client self-sign certificate.
+ * Always return 1 to accept any certificate. This is because we allow the peer to
+ * use a temporary self-signed certificate for DTLS.
  */
-static int openssl_verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
+static int openssl_dtls_verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
 {
     return 1;
 }
@@ -495,7 +495,7 @@ static int openssl_verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
 /**
  * Initializes DTLS context for client role using ECDHE.
  */
-static av_cold int openssl_init_dtls_context(DTLSContext *ctx, SSL_CTX *dtls_ctx)
+static av_cold int openssl_dtls_init_context(DTLSContext *ctx, SSL_CTX *dtls_ctx)
 {
     int ret = 0;
     void *s1 = ctx->log_avcl;
@@ -530,7 +530,7 @@ static av_cold int openssl_init_dtls_context(DTLSContext *ctx, SSL_CTX *dtls_ctx
     }
 
     /* Server will send Certificate Request. */
-    SSL_CTX_set_verify(dtls_ctx, SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE, openssl_verify_callback);
+    SSL_CTX_set_verify(dtls_ctx, SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE, openssl_dtls_verify_callback);
     /* The depth count is "level 0:peer certificate", "level 1: CA certificate",
      * "level 2: higher level CA certificate", and so on. */
     SSL_CTX_set_verify_depth(dtls_ctx, 4);
@@ -562,7 +562,7 @@ static long openssl_dtls_bio_out_callback(BIO* b, int oper, const char* argp, in
     if (oper != BIO_CB_WRITE || !argp || argi <= 0)
         return r0;
 
-    openssl_state_trace(ctx, data, req_size, 0);
+    openssl_dtls_state_trace(ctx, data, req_size, 0);
     ret = ffurl_write(ctx->udp_uc, argp, argi);
     content_type = req_size > 0 ? data[0] : 0;
     handshake_type = req_size > 13 ? data[13] : 0;
@@ -617,7 +617,7 @@ static int dtls_context_handshake(DTLSContext *ctx)
         goto end;
     }
 
-    ret = openssl_init_dtls_context(ctx, dtls_ctx);
+    ret = openssl_dtls_init_context(ctx, dtls_ctx);
     if (ret < 0) {
         av_log(s1, AV_LOG_ERROR, "Failed to initialize DTLS context\n");
         goto end;
@@ -632,7 +632,7 @@ static int dtls_context_handshake(DTLSContext *ctx)
 
     /* Setup the callback for logging. */
     SSL_set_ex_data(dtls, 0, ctx);
-    SSL_set_info_callback(dtls, openssl_on_info);
+    SSL_set_info_callback(dtls, openssl_dtls_on_info);
 
     /**
      * We have set the MTU to fragment the DTLS packet. It is important to note that the
@@ -719,7 +719,7 @@ static int dtls_context_handshake(DTLSContext *ctx)
         }
 
         /* Got DTLS response successfully. */
-        openssl_state_trace(ctx, buf, ret, 1);
+        openssl_dtls_state_trace(ctx, buf, ret, 1);
         if ((r0 = BIO_write(bio_in, buf, ret)) <= 0) {
             res_ct = ret > 0 ? buf[0]: 0;
             res_ht = ret > 13 ? buf[13] : 0;
