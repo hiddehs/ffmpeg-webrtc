@@ -366,7 +366,11 @@ end:
 
 static int openssl_dtls_verify_callback(int preverify_ok, X509_STORE_CTX *ctx);
 static void openssl_dtls_on_info(const SSL *dtls, int where, int ret);
+#if OPENSSL_VERSION_NUMBER < 0x30000000L // v3.0.x
 static long openssl_dtls_bio_out_callback(BIO* b, int oper, const char* argp, int argi, long argl, long retvalue);
+#else
+static long openssl_dtls_bio_out_callback_ex(BIO *b, int oper, const char *argp, size_t len, int argi, long argl, int retvalue, size_t *processed);
+#endif
 
 /**
  * Initializes DTLS context using ECDHE.
@@ -482,7 +486,11 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
      * Note that there should be more packets in real world, like ServerKeyExchange, CertificateRequest,
      * and ServerHelloDone. Here we just use two packets for example.
      */
+#if OPENSSL_VERSION_NUMBER < 0x30000000L // v3.0.x
     BIO_set_callback(bio_out, openssl_dtls_bio_out_callback);
+#else
+    BIO_set_callback_ex(bio_out, openssl_dtls_bio_out_callback_ex);
+#endif
     BIO_set_callback_arg(bio_out, (char*)ctx);
 
     SSL_set_bio(dtls, bio_in, bio_out);
@@ -615,20 +623,32 @@ static int openssl_dtls_verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
 /**
  * DTLS BIO read callback.
  */
+#if OPENSSL_VERSION_NUMBER < 0x30000000L // v3.0.x
 static long openssl_dtls_bio_out_callback(BIO* b, int oper, const char* argp, int argi, long argl, long retvalue)
+#else
+static long openssl_dtls_bio_out_callback_ex(BIO *b, int oper, const char *argp, size_t len, int argi, long argl, int retvalue, size_t *processed)
+#endif
 {
     int ret, req_size = argi, is_arq = 0;
     uint8_t content_type, handshake_type;
     uint8_t *data = (uint8_t*)argp;
-    long r0 = (BIO_CB_RETURN & oper) ? retvalue : 1;
     DTLSContext* ctx = b ? (DTLSContext*)BIO_get_callback_arg(b) : NULL;
     void *s1 = ctx ? ctx->log_avcl : NULL;
 
-    if (oper != BIO_CB_WRITE || !argp || argi <= 0)
-        return r0;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L // v3.0.x
+    req_size = len;
+    av_log(s1, AV_LOG_DEBUG, "bio callback b=%p, oper=%d, argp=%p, len=%ld, argi=%d, argl=%ld, retvalue=%d, processed=%p, req_size=%d\n",
+        b, oper, argp, len, argi, argl, retvalue, processed, req_size);
+#else
+    av_log(s1, AV_LOG_DEBUG, "bio callback b=%p, oper=%d, argp=%p, argi=%d, argl=%ld, retvalue=%ld, req_size=%d\n",
+        b, oper, argp, argi, argl, retvalue, req_size);
+#endif
+
+    if (oper != BIO_CB_WRITE || !argp || req_size <= 0)
+        return retvalue;
 
     openssl_dtls_state_trace(ctx, data, req_size, 0);
-    ret = ffurl_write(ctx->udp_uc, argp, argi);
+    ret = ffurl_write(ctx->udp_uc, argp, req_size);
     content_type = req_size > 0 ? data[0] : 0;
     handshake_type = req_size > 13 ? data[13] : 0;
 
@@ -643,7 +663,7 @@ static long openssl_dtls_bio_out_callback(BIO* b, int oper, const char* argp, in
         return ret;
     }
 
-    return r0;
+    return retvalue;
 }
 
 /**
