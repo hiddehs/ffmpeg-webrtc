@@ -155,6 +155,12 @@ typedef struct DTLSContext {
     /* For av_log to write log to this category. */
     void *log_avcl;
 
+    /* The DTLS context. */
+    SSL_CTX *dtls_ctx;
+    SSL *dtls;
+    /* The DTLS BIOs. */
+    BIO *bio_in;
+
     /* The private key for DTLS handshake. */
     EVP_PKEY *dtls_pkey;
     /* The SSL certificate used for fingerprint in SDP and DTLS handshake. */
@@ -257,15 +263,12 @@ end:
     return ret;
 }
 
-/**
- * Generate a self-signed certificate and private key for DTLS.
- */
-static av_cold int dtls_context_init(DTLSContext *ctx)
+static int openssl_dtls_gen_certificate(DTLSContext *ctx)
 {
     int ret = 0, serial, expire_day, i, n = 0;
     AVBPrint fingerprint;
     unsigned char md[EVP_MAX_MD_SIZE];
-    const char *aor = "ffmpeg.org", *curve = NULL;
+    const char *aor = "ffmpeg.org";
     X509_NAME* subject = NULL;
     X509 *dtls_cert = NULL;
     void *s1 = ctx->log_avcl;
@@ -273,17 +276,12 @@ static av_cold int dtls_context_init(DTLSContext *ctx)
     /* To prevent a crash during cleanup, always initialize it. */
     av_bprint_init(&fingerprint, 1, MAX_URL_SIZE);
 
-    ctx->dtls_cert = dtls_cert = X509_new();
+    dtls_cert = ctx->dtls_cert = X509_new();
     if (!dtls_cert) {
         ret = AVERROR(ENOMEM);
         goto end;
     }
 
-    /* Generate a private key to ctx->dtls_pkey. */
-    if ((ret = openssl_dtls_gen_private_key(ctx)) < 0)
-        goto end;
-
-    /* Generate a self-signed certificate. */
     subject = X509_NAME_new();
     if (!subject) {
         ret = AVERROR(ENOMEM);
@@ -372,11 +370,152 @@ static av_cold int dtls_context_init(DTLSContext *ctx)
         goto end;
     }
 
-    av_log(s1, AV_LOG_INFO, "DTLS: Curve=%s, fingerprint %s\n", curve ? curve : "", ctx->dtls_fingerprint);
-
 end:
     X509_NAME_free(subject);
     av_bprint_finalize(&fingerprint, NULL);
+    return ret;
+}
+
+static int openssl_dtls_verify_callback(int preverify_ok, X509_STORE_CTX *ctx);
+static void openssl_dtls_on_info(const SSL *dtls, int where, int ret);
+static long openssl_dtls_bio_out_callback(BIO* b, int oper, const char* argp, int argi, long argl, long retvalue);
+
+/**
+ * Initializes DTLS context using ECDHE.
+ */
+static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
+{
+    int ret = 0;
+    void *s1 = ctx->log_avcl;
+    EVP_PKEY *dtls_pkey = ctx->dtls_pkey;
+    X509 *dtls_cert = ctx->dtls_cert;
+    SSL_CTX *dtls_ctx = NULL;
+    SSL *dtls = NULL;
+    BIO *bio_in = NULL, *bio_out = NULL;
+
+#if OPENSSL_VERSION_NUMBER < 0x10002000L /* OpenSSL v1.0.2 */
+    dtls_ctx = ctx->dtls_ctx = SSL_CTX_new(DTLSv1_method());
+#else
+    dtls_ctx = ctx->dtls_ctx = SSL_CTX_new(DTLS_method());
+#endif
+    if (!dtls_ctx) {
+        return AVERROR(ENOMEM);
+    }
+
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L /* OpenSSL 1.0.2 */
+    /* For ECDSA, we could set the curves list. */
+    if (SSL_CTX_set1_curves_list(dtls_ctx, "P-521:P-384:P-256") != 1) {
+        av_log(s1, AV_LOG_ERROR, "DTLS: SSL_CTX_set1_curves_list failed\n");
+        return AVERROR(EINVAL);
+    }
+#endif
+
+    /* We use "ALL", while you can use "DEFAULT" means "ALL:!EXPORT:!LOW:!aNULL:!eNULL:!SSLv2" */
+    if (SSL_CTX_set_cipher_list(dtls_ctx, DTLS_CIPHER_SUTES) != 1) {
+        av_log(s1, AV_LOG_ERROR, "DTLS: SSL_CTX_set_cipher_list failed\n");
+        return AVERROR(EINVAL);
+    }
+    /* Setup the certificate. */
+    if (SSL_CTX_use_certificate(dtls_ctx, dtls_cert) != 1) {
+        av_log(s1, AV_LOG_ERROR, "DTLS: SSL_CTX_use_certificate failed\n");
+        return AVERROR(EINVAL);
+    }
+    if (SSL_CTX_use_PrivateKey(dtls_ctx, dtls_pkey) != 1) {
+        av_log(s1, AV_LOG_ERROR, "DTLS: SSL_CTX_use_PrivateKey failed\n");
+        return AVERROR(EINVAL);
+    }
+
+    /* Server will send Certificate Request. */
+    SSL_CTX_set_verify(dtls_ctx, SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE, openssl_dtls_verify_callback);
+    /* The depth count is "level 0:peer certificate", "level 1: CA certificate",
+     * "level 2: higher level CA certificate", and so on. */
+    SSL_CTX_set_verify_depth(dtls_ctx, 4);
+    /* Whether we should read as many input bytes as possible (for non-blocking reads) or not. */
+    SSL_CTX_set_read_ahead(dtls_ctx, 1);
+    /* Only support SRTP_AES128_CM_SHA1_80, please read ssl/d1_srtp.c */
+    if (SSL_CTX_set_tlsext_use_srtp(dtls_ctx, "SRTP_AES128_CM_SHA1_80")) {
+        av_log(s1, AV_LOG_ERROR, "DTLS: SSL_CTX_set_tlsext_use_srtp failed\n");
+        return AVERROR(EINVAL);
+    }
+
+    /* The dtls should not be created unless the dtls_ctx has been initialized. */
+    dtls = ctx->dtls = SSL_new(dtls_ctx);
+    if (!dtls) {
+        return AVERROR(ENOMEM);
+    }
+
+    /* Setup the callback for logging. */
+    SSL_set_ex_data(dtls, 0, ctx);
+    SSL_set_info_callback(dtls, openssl_dtls_on_info);
+
+    /**
+     * We have set the MTU to fragment the DTLS packet. It is important to note that the
+     * packet is split to ensure that each handshake packet is smaller than the MTU.
+     */
+    SSL_set_options(dtls, SSL_OP_NO_QUERY_MTU);
+    SSL_set_mtu(dtls, ctx->pkt_size);
+    DTLS_set_link_mtu(dtls, ctx->pkt_size);
+
+    bio_in = ctx->bio_in = BIO_new(BIO_s_mem());
+    if (!bio_in) {
+        return AVERROR(ENOMEM);
+    }
+
+    bio_out = BIO_new(BIO_s_mem());
+    if (!bio_out) {
+        return AVERROR(ENOMEM);
+    }
+
+    /**
+     * Please be aware that it is necessary to use a callback to obtain the packet to be written out. It is
+     * imperative that BIO_get_mem_data is not used to retrieve the packet, as it returns all the bytes that
+     * need to be sent out.
+     * For example, if MTU is set to 1200, and we got two DTLS packets to sendout:
+     *      ServerHello, 95bytes.
+     *      Certificate, 1105+143=1248bytes.
+     * If use BIO_get_mem_data, it will return 95+1248=1343bytes, which is larger than MTU 1200.
+     * If use callback, it will return two UDP packets:
+     *      ServerHello+Certificate(Frament) = 95+1105=1200bytes.
+     *      Certificate(Fragment) = 143bytes.
+     * Note that there should be more packets in real world, like ServerKeyExchange, CertificateRequest,
+     * and ServerHelloDone. Here we just use two packets for example.
+     */
+    BIO_set_callback(bio_out, openssl_dtls_bio_out_callback);
+    BIO_set_callback_arg(bio_out, (char*)ctx);
+
+    SSL_set_bio(dtls, bio_in, bio_out);
+
+    return ret;
+}
+
+/**
+ * Generate a self-signed certificate and private key for DTLS.
+ */
+static av_cold int dtls_context_init(DTLSContext *ctx)
+{
+    int ret = 0;
+    void *s1 = ctx->log_avcl;
+
+    /* Generate a private key to ctx->dtls_pkey. */
+    if ((ret = openssl_dtls_gen_private_key(ctx)) < 0) {
+        av_log(s1, AV_LOG_ERROR, "Failed to generate DTLS private key\n");
+        goto end;
+    }
+
+    /* Generate a self-signed certificate. */
+    if ((ret = openssl_dtls_gen_certificate(ctx)) < 0) {
+        av_log(s1, AV_LOG_ERROR, "Failed to generate DTLS certificate\n");
+        goto end;
+    }
+
+    if ((ret = openssl_dtls_init_context(ctx)) < 0) {
+        av_log(s1, AV_LOG_ERROR, "Failed to initialize DTLS context\n");
+        goto end;
+    }
+
+    av_log(s1, AV_LOG_INFO, "DTLS: Setup ok, MTU=%d, fingerprint %s\n", ctx->pkt_size, ctx->dtls_fingerprint);
+
+end:
     return ret;
 }
 
@@ -385,6 +524,8 @@ end:
  */
 static av_cold void dtls_context_deinit(DTLSContext *ctx)
 {
+    SSL_free(ctx->dtls);
+    SSL_CTX_free(ctx->dtls_ctx);
     X509_free(ctx->dtls_cert);
     EVP_PKEY_free(ctx->dtls_pkey);
     av_freep(&ctx->dtls_fingerprint);
@@ -466,61 +607,6 @@ static int openssl_dtls_verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
 }
 
 /**
- * Initializes DTLS context for client role using ECDHE.
- */
-static av_cold int openssl_dtls_init_context(DTLSContext *ctx, SSL_CTX *dtls_ctx)
-{
-    int ret = 0;
-    void *s1 = ctx->log_avcl;
-    EVP_PKEY *dtls_pkey = ctx->dtls_pkey;
-    X509 *dtls_cert = ctx->dtls_cert;
-
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L /* OpenSSL 1.0.2 */
-    /* For ECDSA, we could set the curves list. */
-    if (SSL_CTX_set1_curves_list(dtls_ctx, "P-521:P-384:P-256") != 1) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: SSL_CTX_set1_curves_list failed\n");
-        ret = AVERROR(EINVAL);
-        goto end;
-    }
-#endif
-
-    /* We use "ALL", while you can use "DEFAULT" means "ALL:!EXPORT:!LOW:!aNULL:!eNULL:!SSLv2" */
-    if (SSL_CTX_set_cipher_list(dtls_ctx, DTLS_CIPHER_SUTES) != 1) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: SSL_CTX_set_cipher_list failed\n");
-        ret = AVERROR(EINVAL);
-        goto end;
-    }
-    /* Setup the certificate. */
-    if (SSL_CTX_use_certificate(dtls_ctx, dtls_cert) != 1) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: SSL_CTX_use_certificate failed\n");
-        ret = AVERROR(EINVAL);
-        goto end;
-    }
-    if (SSL_CTX_use_PrivateKey(dtls_ctx, dtls_pkey) != 1) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: SSL_CTX_use_PrivateKey failed\n");
-        ret = AVERROR(EINVAL);
-        goto end;
-    }
-
-    /* Server will send Certificate Request. */
-    SSL_CTX_set_verify(dtls_ctx, SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE, openssl_dtls_verify_callback);
-    /* The depth count is "level 0:peer certificate", "level 1: CA certificate",
-     * "level 2: higher level CA certificate", and so on. */
-    SSL_CTX_set_verify_depth(dtls_ctx, 4);
-    /* Whether we should read as many input bytes as possible (for non-blocking reads) or not. */
-    SSL_CTX_set_read_ahead(dtls_ctx, 1);
-    /* Only support SRTP_AES128_CM_SHA1_80, please read ssl/d1_srtp.c */
-    if (SSL_CTX_set_tlsext_use_srtp(dtls_ctx, "SRTP_AES128_CM_SHA1_80")) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: SSL_CTX_set_tlsext_use_srtp failed\n");
-        ret = AVERROR(EINVAL);
-        goto end;
-    }
-
-end:
-    return ret;
-}
-
-/**
  * DTLS BIO read callback.
  */
 static long openssl_dtls_bio_out_callback(BIO* b, int oper, const char* argp, int argi, long argl, long retvalue)
@@ -565,86 +651,20 @@ static long openssl_dtls_bio_out_callback(BIO* b, int oper, const char* argp, in
  */
 static int dtls_context_handshake(DTLSContext *ctx)
 {
-    int ret, loop, res_ct, res_ht, r0, r1;
-    SSL_CTX *dtls_ctx = NULL;
-    SSL *dtls = NULL;
+    int ret = 0, loop, res_ct, res_ht, r0, r1;
+    SSL *dtls = ctx->dtls;
     const char* dst = "EXTRACTOR-dtls_srtp";
-    BIO *bio_in = NULL, *bio_out = NULL;
+    BIO *bio_in = ctx->bio_in;
     int64_t starttime = av_gettime();
     void *s1 = ctx->log_avcl;
     char buf[MAX_UDP_BUFFER_SIZE];
-
-#if OPENSSL_VERSION_NUMBER < 0x10002000L /* OpenSSL v1.0.2 */
-    dtls_ctx = SSL_CTX_new(DTLSv1_method());
-#else
-    dtls_ctx = SSL_CTX_new(DTLS_method());
-#endif
-    if (!dtls_ctx) {
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
+    char detail_error[256];
 
     if (!ctx->udp_uc) {
         av_log(s1, AV_LOG_ERROR, "DTLS: No UDP context\n");
         ret = AVERROR(EIO);
         goto end;
     }
-
-    ret = openssl_dtls_init_context(ctx, dtls_ctx);
-    if (ret < 0) {
-        av_log(s1, AV_LOG_ERROR, "Failed to initialize DTLS context\n");
-        goto end;
-    }
-
-    /* The dtls should not be created unless the dtls_ctx has been initialized. */
-    dtls = SSL_new(dtls_ctx);
-    if (!dtls) {
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
-
-    /* Setup the callback for logging. */
-    SSL_set_ex_data(dtls, 0, ctx);
-    SSL_set_info_callback(dtls, openssl_dtls_on_info);
-
-    /**
-     * We have set the MTU to fragment the DTLS packet. It is important to note that the
-     * packet is split to ensure that each handshake packet is smaller than the MTU.
-     */
-    SSL_set_options(dtls, SSL_OP_NO_QUERY_MTU);
-    SSL_set_mtu(dtls, ctx->pkt_size);
-    DTLS_set_link_mtu(dtls, ctx->pkt_size);
-
-    bio_in = BIO_new(BIO_s_mem());
-    if (!bio_in) {
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
-
-    bio_out = BIO_new(BIO_s_mem());
-    if (!bio_out) {
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
-
-    /**
-     * Please be aware that it is necessary to use a callback to obtain the packet to be written out. It is
-     * imperative that BIO_get_mem_data is not used to retrieve the packet, as it returns all the bytes that
-     * need to be sent out.
-     * For example, if MTU is set to 1200, and we got two DTLS packets to sendout:
-     *      ServerHello, 95bytes.
-     *      Certificate, 1105+143=1248bytes.
-     * If use BIO_get_mem_data, it will return 95+1248=1343bytes, which is larger than MTU 1200.
-     * If use callback, it will return two UDP packets:
-     *      ServerHello+Certificate(Frament) = 95+1105=1200bytes.
-     *      Certificate(Fragment) = 143bytes.
-     * Note that there should be more packets in real world, like ServerKeyExchange, CertificateRequest,
-     * and ServerHelloDone. Here we just use two packets for example.
-     */
-    BIO_set_callback(bio_out, openssl_dtls_bio_out_callback);
-    BIO_set_callback_arg(bio_out, (char*)ctx);
-
-    SSL_set_bio(dtls, bio_in, bio_out);
 
     /* Setup DTLS as passive, which is server role. */
     SSL_set_accept_state(dtls);
@@ -702,10 +722,13 @@ static int dtls_context_handshake(DTLSContext *ctx)
          * We limit the MTU to 1200 for DTLS handshake, which ensures that the buffer is large enough for reading.
          */
         r0 = SSL_read(dtls, buf, sizeof(buf));
-        r1 = SSL_get_error(dtls, r0); ERR_clear_error();
+        r1 = SSL_get_error(dtls, r0);
+        if (r0 < 0 && r1 == SSL_ERROR_SSL)
+            ERR_error_string_n(ERR_get_error(), detail_error, sizeof(detail_error));
+        ERR_clear_error();
         if (r0 <= 0) {
             if (r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE && r1 != SSL_ERROR_ZERO_RETURN) {
-                av_log(s1, AV_LOG_ERROR, "DTLS: Read failed, loop=%d, r0=%d, r1=%d\n", loop, r0, r1);
+                av_log(s1, AV_LOG_ERROR, "DTLS: Read failed, loop=%d, r0=%d, r1=%d, %s\n", loop, r0, r1, detail_error);
                 ret = AVERROR(EIO);
                 goto end;
             }
@@ -739,8 +762,6 @@ static int dtls_context_handshake(DTLSContext *ctx)
         (int)(av_gettime() - starttime) / 1000);
 
 end:
-    SSL_free(dtls);
-    SSL_CTX_free(dtls_ctx);
     return ret;
 }
 
