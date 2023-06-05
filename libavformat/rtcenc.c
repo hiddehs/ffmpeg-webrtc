@@ -460,7 +460,9 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
      */
     SSL_set_options(dtls, SSL_OP_NO_QUERY_MTU);
     SSL_set_mtu(dtls, ctx->pkt_size);
+#if OPENSSL_VERSION_NUMBER >= 0x100010b0L /* OpenSSL 1.0.1k */
     DTLS_set_link_mtu(dtls, ctx->pkt_size);
+#endif
 
     bio_in = ctx->bio_in = BIO_new(BIO_s_mem());
     if (!bio_in) {
@@ -637,10 +639,10 @@ static long openssl_dtls_bio_out_callback_ex(BIO *b, int oper, const char *argp,
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L // v3.0.x
     req_size = len;
-    av_log(s1, AV_LOG_DEBUG, "bio callback b=%p, oper=%d, argp=%p, len=%ld, argi=%d, argl=%ld, retvalue=%d, processed=%p, req_size=%d\n",
+    av_log(s1, AV_LOG_DEBUG, "DTLS: bio callback b=%p, oper=%d, argp=%p, len=%ld, argi=%d, argl=%ld, retvalue=%d, processed=%p, req_size=%d\n",
         b, oper, argp, len, argi, argl, retvalue, processed, req_size);
 #else
-    av_log(s1, AV_LOG_DEBUG, "bio callback b=%p, oper=%d, argp=%p, argi=%d, argl=%ld, retvalue=%ld, req_size=%d\n",
+    av_log(s1, AV_LOG_DEBUG, "DTLS: bio callback b=%p, oper=%d, argp=%p, argi=%d, argl=%ld, retvalue=%ld, req_size=%d\n",
         b, oper, argp, argi, argl, retvalue, req_size);
 #endif
 
