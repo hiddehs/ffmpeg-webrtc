@@ -170,9 +170,6 @@ typedef struct DTLSContext {
      */
     uint8_t dtls_srtp_material[DTLS_SRTP_MASTER_KEY_LEN * 2];
 
-    /* Whether the timer should be reset. */
-    // TODO: FIXME: Remove it.
-    int dtls_should_reset_timer;
     /* Whether the DTLS is done at least for us. */
     int dtls_done_for_us;
     /* The number of packets retransmitted for DTLS. */
@@ -439,30 +436,6 @@ static void openssl_dtls_on_info(const SSL *dtls, int where, int ret)
     }
 }
 
-#if OPENSSL_VERSION_NUMBER >= 0x10101000L /* OpenSSL 1.1.1 */
-static unsigned int openssl_dtls_timer_cb(SSL *dtls, unsigned int previous_us)
-{
-    DTLSContext *ctx = (DTLSContext*)SSL_get_ex_data(dtls, 0);
-    void *s1 = ctx->log_avcl;
-
-    /* Double the timeout, note that it may be 0. */
-    unsigned int timeout_us = previous_us * 2;
-
-    /* If previous_us is 0, for example, the HelloVerifyRequest, we should respond it ASAP.
-     * when got ServerHello, we should reset the timer. */
-    if (!previous_us || ctx->dtls_should_reset_timer)
-        timeout_us =  DTLS_SSL_TIMER_BASE + ctx->dtls_arq_timeout * 1000; /* in us */
-
-    /* never exceed the max timeout. */
-    timeout_us = FFMIN(timeout_us, 30 * 1000 * 1000); /* in us */
-
-    av_log(s1, AV_LOG_VERBOSE, "DTLS: ARQ timer cb timeout=%ums, previous=%ums\n",
-        timeout_us / 1000, previous_us / 1000);
-
-    return timeout_us;
-}
-#endif
-
 static void openssl_dtls_state_trace(DTLSContext *ctx, uint8_t *data, int length, int incoming)
 {
     uint8_t content_type = 0;
@@ -641,11 +614,6 @@ static int dtls_context_handshake(DTLSContext *ctx)
     SSL_set_options(dtls, SSL_OP_NO_QUERY_MTU);
     SSL_set_mtu(dtls, ctx->pkt_size);
     DTLS_set_link_mtu(dtls, ctx->pkt_size);
-
-#if OPENSSL_VERSION_NUMBER >= 0x10101000L /* OpenSSL 1.1.1 */
-    /* Set the callback for ARQ timer. */
-    DTLS_set_timer_cb(dtls, openssl_dtls_timer_cb);
-#endif
 
     bio_in = BIO_new(BIO_s_mem());
     if (!bio_in) {
