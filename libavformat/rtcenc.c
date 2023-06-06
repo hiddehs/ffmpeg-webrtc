@@ -191,6 +191,127 @@ typedef struct DTLSContext {
     int pkt_size;
 } DTLSContext;
 
+/**
+ * Callback function to print the OpenSSL SSL status.
+ */
+static void openssl_dtls_on_info(const SSL *dtls, int where, int ret)
+{
+    int w, r1;
+    const char *method = "undefined", *alert_type, *alert_desc;
+    DTLSContext *ctx = (DTLSContext*)SSL_get_ex_data(dtls, 0);
+    void *s1 = ctx->log_avcl;
+
+    w = where & ~SSL_ST_MASK;
+    if (w & SSL_ST_CONNECT)
+        method = "SSL_connect";
+    else if (w & SSL_ST_ACCEPT)
+        method = "SSL_accept";
+
+    r1 = SSL_get_error(dtls, ret);
+    if (where & SSL_CB_LOOP) {
+        av_log(s1, AV_LOG_VERBOSE, "DTLS: method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
+            method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, ret, r1);
+    } else if (where & SSL_CB_ALERT) {
+        method = (where & SSL_CB_READ) ? "read":"write";
+
+        alert_type = SSL_alert_type_string_long(ret);
+        alert_desc = SSL_alert_desc_string(ret);
+
+        if (!av_strcasecmp(alert_type, "warning") && !av_strcasecmp(alert_desc, "CN"))
+            av_log(s1, AV_LOG_WARNING, "DTLS: SSL3 alert method=%s type=%s, desc=%s(%s), where=%d, ret=%d, r1=%d\n",
+                method, alert_type, alert_desc, SSL_alert_desc_string_long(ret), where, ret, r1);
+        else
+            av_log(s1, AV_LOG_ERROR, "DTLS: SSL3 alert method=%s type=%s, desc=%s(%s), where=%d, ret=%d, r1=%d\n",
+                method, alert_type, alert_desc, SSL_alert_desc_string_long(ret), where, ret, r1);
+    } else if (where & SSL_CB_EXIT) {
+        if (!ret)
+            av_log(s1, AV_LOG_WARNING, "DTLS: Fail method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
+                method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, ret, r1);
+        else if (ret < 0)
+            if (r1 != SSL_ERROR_NONE && r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE)
+                av_log(s1, AV_LOG_ERROR, "DTLS: Error method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
+                    method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, ret, r1);
+            else
+                av_log(s1, AV_LOG_VERBOSE, "DTLS: method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
+                    method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, ret, r1);
+    }
+}
+
+static void openssl_dtls_state_trace(DTLSContext *ctx, uint8_t *data, int length, int incoming)
+{
+    uint8_t content_type = 0;
+    uint16_t size = 0;
+    uint8_t handshake_type = 0;
+    void *s1 = ctx->log_avcl;
+
+    /* Change_cipher_spec(20), alert(21), handshake(22), application_data(23) */
+    if (length >= 1)
+        content_type = (uint8_t)data[0];
+    if (length >= 13)
+        size = (uint16_t)(data[11])<<8 | (uint16_t)data[12];
+    if (length >= 14)
+        handshake_type = (uint8_t)data[13];
+
+    av_log(s1, AV_LOG_VERBOSE, "WHIP: DTLS state %s %s, done=%u, arq=%u, len=%u, cnt=%u, size=%u, hs=%u\n",
+        "Active", (incoming? "RECV":"SEND"), ctx->dtls_done_for_us, ctx->dtls_arq_packets, length,
+        content_type, size, handshake_type);
+}
+
+/**
+ * Always return 1 to accept any certificate. This is because we allow the peer to
+ * use a temporary self-signed certificate for DTLS.
+ */
+static int openssl_dtls_verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
+{
+    return 1;
+}
+
+/**
+ * DTLS BIO read callback.
+ */
+#if OPENSSL_VERSION_NUMBER < 0x30000000L // v3.0.x
+static long openssl_dtls_bio_out_callback(BIO* b, int oper, const char* argp, int argi, long argl, long retvalue)
+#else
+static long openssl_dtls_bio_out_callback_ex(BIO *b, int oper, const char *argp, size_t len, int argi, long argl, int retvalue, size_t *processed)
+#endif
+{
+    int ret, req_size = argi, is_arq = 0;
+    uint8_t content_type, handshake_type;
+    uint8_t *data = (uint8_t*)argp;
+    DTLSContext* ctx = b ? (DTLSContext*)BIO_get_callback_arg(b) : NULL;
+    void *s1 = ctx ? ctx->log_avcl : NULL;
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L // v3.0.x
+    req_size = len;
+    av_log(s1, AV_LOG_DEBUG, "DTLS: bio callback b=%p, oper=%d, argp=%p, len=%ld, argi=%d, argl=%ld, retvalue=%d, processed=%p, req_size=%d\n",
+        b, oper, argp, len, argi, argl, retvalue, processed, req_size);
+#else
+    av_log(s1, AV_LOG_DEBUG, "DTLS: bio callback b=%p, oper=%d, argp=%p, argi=%d, argl=%ld, retvalue=%ld, req_size=%d\n",
+        b, oper, argp, argi, argl, retvalue, req_size);
+#endif
+
+    if (oper != BIO_CB_WRITE || !argp || req_size <= 0)
+        return retvalue;
+
+    openssl_dtls_state_trace(ctx, data, req_size, 0);
+    ret = ffurl_write(ctx->udp_uc, argp, req_size);
+    content_type = req_size > 0 ? data[0] : 0;
+    handshake_type = req_size > 13 ? data[13] : 0;
+
+    is_arq = ctx->dtls_last_content_type == content_type && ctx->dtls_last_handshake_type == handshake_type;
+    ctx->dtls_arq_packets += is_arq;
+    ctx->dtls_last_content_type = content_type;
+    ctx->dtls_last_handshake_type = handshake_type;
+
+    if (ret < 0) {
+        av_log(s1, AV_LOG_ERROR, "DTLS: Send request failed, oper=%d, content=%d, handshake=%d, size=%d, is_arq=%d\n",
+            oper, content_type, handshake_type, req_size, is_arq);
+        return ret;
+    }
+
+    return retvalue;
+}
+
 static int openssl_dtls_gen_private_key(DTLSContext *ctx)
 {
     int ret = 0;
@@ -363,14 +484,6 @@ end:
     av_bprint_finalize(&fingerprint, NULL);
     return ret;
 }
-
-static int openssl_dtls_verify_callback(int preverify_ok, X509_STORE_CTX *ctx);
-static void openssl_dtls_on_info(const SSL *dtls, int where, int ret);
-#if OPENSSL_VERSION_NUMBER < 0x30000000L // v3.0.x
-static long openssl_dtls_bio_out_callback(BIO* b, int oper, const char* argp, int argi, long argl, long retvalue);
-#else
-static long openssl_dtls_bio_out_callback_ex(BIO *b, int oper, const char *argp, size_t len, int argi, long argl, int retvalue, size_t *processed);
-#endif
 
 /**
  * Initializes DTLS context using ECDHE.
@@ -548,127 +661,6 @@ static av_cold void dtls_context_deinit(DTLSContext *ctx)
 }
 
 /**
- * Callback function to print the OpenSSL SSL status.
- */
-static void openssl_dtls_on_info(const SSL *dtls, int where, int ret)
-{
-    int w, r1;
-    const char *method = "undefined", *alert_type, *alert_desc;
-    DTLSContext *ctx = (DTLSContext*)SSL_get_ex_data(dtls, 0);
-    void *s1 = ctx->log_avcl;
-
-    w = where & ~SSL_ST_MASK;
-    if (w & SSL_ST_CONNECT)
-        method = "SSL_connect";
-    else if (w & SSL_ST_ACCEPT)
-        method = "SSL_accept";
-
-    r1 = SSL_get_error(dtls, ret);
-    if (where & SSL_CB_LOOP) {
-        av_log(s1, AV_LOG_VERBOSE, "DTLS: method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
-            method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, ret, r1);
-    } else if (where & SSL_CB_ALERT) {
-        method = (where & SSL_CB_READ) ? "read":"write";
-
-        alert_type = SSL_alert_type_string_long(ret);
-        alert_desc = SSL_alert_desc_string(ret);
-
-        if (!av_strcasecmp(alert_type, "warning") && !av_strcasecmp(alert_desc, "CN"))
-            av_log(s1, AV_LOG_WARNING, "DTLS: SSL3 alert method=%s type=%s, desc=%s(%s), where=%d, ret=%d, r1=%d\n",
-                method, alert_type, alert_desc, SSL_alert_desc_string_long(ret), where, ret, r1);
-        else
-            av_log(s1, AV_LOG_ERROR, "DTLS: SSL3 alert method=%s type=%s, desc=%s(%s), where=%d, ret=%d, r1=%d\n",
-                method, alert_type, alert_desc, SSL_alert_desc_string_long(ret), where, ret, r1);
-    } else if (where & SSL_CB_EXIT) {
-        if (!ret)
-            av_log(s1, AV_LOG_WARNING, "DTLS: Fail method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
-                method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, ret, r1);
-        else if (ret < 0)
-            if (r1 != SSL_ERROR_NONE && r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE)
-                av_log(s1, AV_LOG_ERROR, "DTLS: Error method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
-                    method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, ret, r1);
-            else
-                av_log(s1, AV_LOG_VERBOSE, "DTLS: method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
-                    method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, ret, r1);
-    }
-}
-
-static void openssl_dtls_state_trace(DTLSContext *ctx, uint8_t *data, int length, int incoming)
-{
-    uint8_t content_type = 0;
-    uint16_t size = 0;
-    uint8_t handshake_type = 0;
-    void *s1 = ctx->log_avcl;
-
-    /* Change_cipher_spec(20), alert(21), handshake(22), application_data(23) */
-    if (length >= 1)
-        content_type = (uint8_t)data[0];
-    if (length >= 13)
-        size = (uint16_t)(data[11])<<8 | (uint16_t)data[12];
-    if (length >= 14)
-        handshake_type = (uint8_t)data[13];
-
-    av_log(s1, AV_LOG_VERBOSE, "WHIP: DTLS state %s %s, done=%u, arq=%u, len=%u, cnt=%u, size=%u, hs=%u\n",
-        "Active", (incoming? "RECV":"SEND"), ctx->dtls_done_for_us, ctx->dtls_arq_packets, length,
-        content_type, size, handshake_type);
-}
-
-/**
- * Always return 1 to accept any certificate. This is because we allow the peer to
- * use a temporary self-signed certificate for DTLS.
- */
-static int openssl_dtls_verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
-{
-    return 1;
-}
-
-/**
- * DTLS BIO read callback.
- */
-#if OPENSSL_VERSION_NUMBER < 0x30000000L // v3.0.x
-static long openssl_dtls_bio_out_callback(BIO* b, int oper, const char* argp, int argi, long argl, long retvalue)
-#else
-static long openssl_dtls_bio_out_callback_ex(BIO *b, int oper, const char *argp, size_t len, int argi, long argl, int retvalue, size_t *processed)
-#endif
-{
-    int ret, req_size = argi, is_arq = 0;
-    uint8_t content_type, handshake_type;
-    uint8_t *data = (uint8_t*)argp;
-    DTLSContext* ctx = b ? (DTLSContext*)BIO_get_callback_arg(b) : NULL;
-    void *s1 = ctx ? ctx->log_avcl : NULL;
-
-#if OPENSSL_VERSION_NUMBER >= 0x30000000L // v3.0.x
-    req_size = len;
-    av_log(s1, AV_LOG_DEBUG, "DTLS: bio callback b=%p, oper=%d, argp=%p, len=%ld, argi=%d, argl=%ld, retvalue=%d, processed=%p, req_size=%d\n",
-        b, oper, argp, len, argi, argl, retvalue, processed, req_size);
-#else
-    av_log(s1, AV_LOG_DEBUG, "DTLS: bio callback b=%p, oper=%d, argp=%p, argi=%d, argl=%ld, retvalue=%ld, req_size=%d\n",
-        b, oper, argp, argi, argl, retvalue, req_size);
-#endif
-
-    if (oper != BIO_CB_WRITE || !argp || req_size <= 0)
-        return retvalue;
-
-    openssl_dtls_state_trace(ctx, data, req_size, 0);
-    ret = ffurl_write(ctx->udp_uc, argp, req_size);
-    content_type = req_size > 0 ? data[0] : 0;
-    handshake_type = req_size > 13 ? data[13] : 0;
-
-    is_arq = ctx->dtls_last_content_type == content_type && ctx->dtls_last_handshake_type == handshake_type;
-    ctx->dtls_arq_packets += is_arq;
-    ctx->dtls_last_content_type = content_type;
-    ctx->dtls_last_handshake_type = handshake_type;
-
-    if (ret < 0) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: Send request failed, oper=%d, content=%d, handshake=%d, size=%d, is_arq=%d\n",
-            oper, content_type, handshake_type, req_size, is_arq);
-        return ret;
-    }
-
-    return retvalue;
-}
-
-/**
  * DTLS handshake with server, as a server in passive mode, using openssl.
  *
  * This function initializes the SSL context as the client role using OpenSSL and
@@ -714,6 +706,7 @@ static int dtls_context_handshake(DTLSContext *ctx)
             (int)(av_gettime() - starttime) / 1000);
         goto end;
     }
+    av_usleep(800 * 1000);
 
     /* Receive DTLS message from peer and drive the DTLS context. */
     for (loop = 0; loop < DTLS_EAGAIN_RETRIES_MAX && !ctx->dtls_done_for_us;) {
