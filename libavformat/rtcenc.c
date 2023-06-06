@@ -661,29 +661,19 @@ static av_cold void dtls_context_deinit(DTLSContext *ctx)
 }
 
 /**
- * DTLS handshake with server, as a server in passive mode, using openssl.
- *
- * This function initializes the SSL context as the client role using OpenSSL and
- * then performs the DTLS handshake until success. Upon successful completion, it
- * exports the SRTP material key.
- *
- * @return 0 if OK, AVERROR_xxx on error
+ * Once the DTLS role has been negotiated - active for the DTLS client or passive for the
+ * DTLS server - we proceed to set up the DTLS state and initiate the handshake.
  */
-static int dtls_context_handshake(DTLSContext *ctx)
+static int dtls_context_start_handshake(DTLSContext *ctx)
 {
-    int ret = 0, loop, res_ct, res_ht, r0, r1;
+    int ret = 0, r0, r1;
     SSL *dtls = ctx->dtls;
-    const char* dst = "EXTRACTOR-dtls_srtp";
-    BIO *bio_in = ctx->bio_in;
-    int64_t starttime = av_gettime();
     void *s1 = ctx->log_avcl;
-    char buf[MAX_UDP_BUFFER_SIZE];
     char detail_error[256];
 
     if (!ctx->udp_uc) {
         av_log(s1, AV_LOG_ERROR, "DTLS: No UDP context\n");
-        ret = AVERROR(EIO);
-        goto end;
+        return AVERROR(EIO);
     }
 
     /* Setup DTLS as passive, which is server role. */
@@ -699,13 +689,39 @@ static int dtls_context_handshake(DTLSContext *ctx)
      * packets are received.
      */
     r0 = SSL_do_handshake(dtls);
-    r1 = SSL_get_error(dtls, r0); ERR_clear_error();
+    r1 = SSL_get_error(dtls, r0);
+    if (r0 < 0 && r1 == SSL_ERROR_SSL)
+        ERR_error_string_n(ERR_get_error(), detail_error, sizeof(detail_error));
+    ERR_clear_error();
     // Fatal SSL error, for example, no available suite when peer is DTLS 1.0 while we are DTLS 1.2.
     if (r0 < 0 && (r1 != SSL_ERROR_NONE && r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE)) {
-        av_log(s1, AV_LOG_ERROR, "Failed to drive SSL context, cost=%dms\n",
-            (int)(av_gettime() - starttime) / 1000);
-        goto end;
+        av_log(s1, AV_LOG_ERROR, "Failed to drive SSL context, r0=%d, r1=%d %s\n", r0, r1, detail_error);
+        return AVERROR(EIO);
     }
+
+    return ret;
+}
+
+/**
+ * DTLS handshake with server, as a server in passive mode, using openssl.
+ *
+ * This function initializes the SSL context as the client role using OpenSSL and
+ * then performs the DTLS handshake until success. Upon successful completion, it
+ * exports the SRTP material key.
+ *
+ * @return 0 if OK, AVERROR_xxx on error
+ */
+static int dtls_context_do_handshake(DTLSContext *ctx)
+{
+    int ret = 0, loop, res_ct, res_ht, r0, r1;
+    SSL *dtls = ctx->dtls;
+    const char* dst = "EXTRACTOR-dtls_srtp";
+    BIO *bio_in = ctx->bio_in;
+    int64_t starttime = av_gettime();
+    void *s1 = ctx->log_avcl;
+    char buf[MAX_UDP_BUFFER_SIZE];
+    char detail_error[256];
+
     av_usleep(800 * 1000);
 
     /* Receive DTLS message from peer and drive the DTLS context. */
@@ -749,7 +765,7 @@ static int dtls_context_handshake(DTLSContext *ctx)
         ERR_clear_error();
         if (r0 <= 0) {
             if (r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE && r1 != SSL_ERROR_ZERO_RETURN) {
-                av_log(s1, AV_LOG_ERROR, "DTLS: Read failed, loop=%d, r0=%d, r1=%d, %s\n", loop, r0, r1, detail_error);
+                av_log(s1, AV_LOG_ERROR, "DTLS: Read failed, loop=%d, r0=%d, r1=%d %s\n", loop, r0, r1, detail_error);
                 ret = AVERROR(EIO);
                 goto end;
             }
@@ -2140,7 +2156,10 @@ static av_cold int rtc_init(AVFormatContext *s)
     /* Now UDP URL context is ready, setup the DTLS transport. */
     rtc->dtls_ctx.udp_uc = rtc->udp_uc;
 
-    if ((ret = dtls_context_handshake(&rtc->dtls_ctx)) < 0)
+    if ((ret = dtls_context_start_handshake(&rtc->dtls_ctx)) < 0)
+        return ret;
+
+    if ((ret = dtls_context_do_handshake(&rtc->dtls_ctx)) < 0)
         return ret;
 
     if ((ret = setup_srtp(s)) < 0)
