@@ -148,11 +148,13 @@ enum DTLSState {
 };
 
 typedef struct DTLSContext DTLSContext;
-typedef int (*DTLSContext_callback_fn)(DTLSContext *b, enum DTLSState state);
+typedef int (*DTLSContext_on_state_fn)(DTLSContext *ctx, enum DTLSState state);
+typedef int (*DTLSContext_on_write_fn)(DTLSContext *ctx, char* data, int size);
 
 typedef struct DTLSContext {
     /* For callback. */
-    DTLSContext_callback_fn callback;
+    DTLSContext_on_state_fn on_state;
+    DTLSContext_on_write_fn on_write;
     void* opaque;
 
     /* For av_log to write log to this category. */
@@ -195,9 +197,6 @@ typedef struct DTLSContext {
      */
     uint8_t dtls_last_content_type;
     uint8_t dtls_last_handshake_type;
-
-    /* The UDP transport is used for delivering ICE, DTLS and SRTP packets. */
-    URLContext *udp_uc;
 
     /* The maximum number of retries for DTLS transmission. */
     int dtls_arq_max;
@@ -317,7 +316,7 @@ static long openssl_dtls_bio_out_callback_ex(BIO *b, int oper, const char *argp,
         return retvalue;
 
     openssl_dtls_state_trace(ctx, data, req_size, 0);
-    ret = ffurl_write(ctx->udp_uc, argp, req_size);
+    ret = ctx->on_write ? ctx->on_write(ctx, data, req_size) : 0;
     content_type = req_size > 0 ? data[0] : 0;
     handshake_type = req_size > 13 ? data[13] : 0;
 
@@ -694,11 +693,6 @@ static int dtls_context_start_handshake(DTLSContext *ctx)
     void *s1 = ctx->log_avcl;
     char detail_error[256];
 
-    if (!ctx->udp_uc) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: No UDP context\n");
-        return AVERROR(EIO);
-    }
-
     ctx->dtls_starttime = av_gettime();
 
     /* Setup DTLS as passive, which is server role. */
@@ -779,7 +773,7 @@ static int dtls_context_handle_message(DTLSContext *ctx, char* buf, int size)
     if (SSL_is_init_finished(dtls) != 1)
         goto end;
 
-    do_callback = ctx->callback && !ctx->dtls_done_for_us;
+    do_callback = ctx->on_state && !ctx->dtls_done_for_us;
     ctx->dtls_done_for_us = 1;
 
     /* Export SRTP master key after DTLS done */
@@ -795,7 +789,7 @@ static int dtls_context_handle_message(DTLSContext *ctx, char* buf, int size)
         ctx->dtls_srtp_key_exported = 1;
     }
 
-    if (do_callback && (ret = ctx->callback(ctx, DTLS_STATE_FINISHED)) < 0)
+    if (do_callback && (ret = ctx->on_state(ctx, DTLS_STATE_FINISHED)) < 0)
         goto end;
 
 end:
@@ -923,7 +917,7 @@ static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size);
 /**
  * When DTLS state change.
  */
-static int dtls_context_callback(DTLSContext *ctx, enum DTLSState state)
+static int dtls_context_on_state(DTLSContext *ctx, enum DTLSState state)
 {
     int ret = 0;
     AVFormatContext *s = ctx->opaque;
@@ -940,6 +934,22 @@ static int dtls_context_callback(DTLSContext *ctx, enum DTLSState state)
 }
 
 /**
+ * When DTLS write data.
+ */
+static int dtls_context_on_write(DTLSContext *ctx, char* data, int size)
+{
+    AVFormatContext *s = ctx->opaque;
+    RTCContext *rtc = s->priv_data;
+
+    if (!rtc->udp_uc) {
+        av_log(s, AV_LOG_ERROR, "WHIP: DTLS write data, but udp_uc is NULL\n");
+        return AVERROR(EIO);
+    }
+
+    return ffurl_write(rtc->udp_uc, data, size);
+}
+
+/**
  * Initialize and check the options for the WebRTC muxer.
  */
 static av_cold int whip_init(AVFormatContext *s)
@@ -953,7 +963,8 @@ static av_cold int whip_init(AVFormatContext *s)
     rtc->dtls_ctx.dtls_arq_timeout = rtc->dtls_arq_timeout;
     rtc->dtls_ctx.pkt_size = rtc->pkt_size;
     rtc->dtls_ctx.opaque = s;
-    rtc->dtls_ctx.callback = dtls_context_callback;
+    rtc->dtls_ctx.on_state = dtls_context_on_state;
+    rtc->dtls_ctx.on_write = dtls_context_on_write;
 
     if ((ret = dtls_context_init(&rtc->dtls_ctx)) < 0) {
         av_log(s, AV_LOG_ERROR, "WHIP: Failed to init DTLS context\n");
@@ -1746,9 +1757,6 @@ static int udp_connect(AVFormatContext *s)
     /* Make the socket non-blocking, set to READ and WRITE mode after connected */
     ff_socket_nonblock(ffurl_get_file_handle(rtc->udp_uc), 1);
     rtc->udp_uc->flags |= AVIO_FLAG_READ | AVIO_FLAG_NONBLOCK;
-
-    /* Now UDP URL context is ready, setup the DTLS transport. */
-    rtc->dtls_ctx.udp_uc = rtc->udp_uc;
 
     if (rtc->state < RTC_STATE_UDP_CONNECTED)
         rtc->state = RTC_STATE_UDP_CONNECTED;
