@@ -1887,7 +1887,7 @@ next_packet:
         }
 
         /* If got any DTLS messages, handle it. */
-        if (is_dtls_packet(rtc->buf, ret)) {
+        if (is_dtls_packet(rtc->buf, ret) && rtc->state >= RTC_STATE_ICE_CONNECTED) {
             if ((ret = dtls_context_write(&rtc->dtls_ctx, rtc->buf, ret)) < 0)
                 goto end;
             goto next_packet;
@@ -1915,13 +1915,13 @@ static int setup_srtp(AVFormatContext *s)
     const char* suite = "AES_CM_128_HMAC_SHA1_80";
     RTCContext *rtc = s->priv_data;
 
-    /* As DTLS client, the send key is client master key plus salt. */
-    memcpy(send_key, rtc->dtls_ctx.dtls_srtp_material, 16);
-    memcpy(send_key + 16, rtc->dtls_ctx.dtls_srtp_material + 32, 14);
+    /* As DTLS server, the recv key is client master key plus salt. */
+    memcpy(recv_key, rtc->dtls_ctx.dtls_srtp_material, 16);
+    memcpy(recv_key + 16, rtc->dtls_ctx.dtls_srtp_material + 32, 14);
 
-    /* As DTLS client, the recv key is server master key plus salt. */
-    memcpy(recv_key, rtc->dtls_ctx.dtls_srtp_material + 16, 16);
-    memcpy(recv_key + 16, rtc->dtls_ctx.dtls_srtp_material + 46, 14);
+    /* As DTLS server, the send key is server master key plus salt. */
+    memcpy(send_key, rtc->dtls_ctx.dtls_srtp_material + 16, 16);
+    memcpy(send_key + 16, rtc->dtls_ctx.dtls_srtp_material + 46, 14);
 
     /* Setup SRTP context for outgoing packets */
     if (!av_base64_encode(buf, sizeof(buf), send_key, sizeof(send_key))) {
@@ -2068,8 +2068,8 @@ static int create_rtp_muxer(AVFormatContext *s)
     av_log(s, AV_LOG_INFO, "WHIP: Muxer is ready, state=%d, buffer_size=%d, max_packet_size=%d, "
                            "elapsed=%dms(init:%d,offer:%d,answer:%d,udp:%d,ice:%d,dtls:%d,srtp:%d,ready:%d)\n",
         rtc->state, buffer_size, max_packet_size, RTC_ELAPSED(rtc->rtc_starttime, av_gettime()),
-       RTC_ELAPSED(rtc->rtc_starttime, rtc->rtc_init_time),
-       RTC_ELAPSED(rtc->rtc_init_time, rtc->rtc_offer_time),
+        RTC_ELAPSED(rtc->rtc_starttime, rtc->rtc_init_time),
+        RTC_ELAPSED(rtc->rtc_init_time, rtc->rtc_offer_time),
         RTC_ELAPSED(rtc->rtc_offer_time, rtc->rtc_answer_time),
         RTC_ELAPSED(rtc->rtc_answer_time, rtc->rtc_udp_time),
         RTC_ELAPSED(rtc->rtc_udp_time, rtc->rtc_ice_time),
