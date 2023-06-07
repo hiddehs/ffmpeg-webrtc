@@ -97,36 +97,15 @@
 #define NALU_TYPE_STAP_A 24
 
 /**
- * Wait for a small timeout in milliseconds to allow for the server to process
- * the Interactive Connectivity Establishment (ICE) request. If we immediately
- * read the response after sending the request, we may receive nothing and need
- * to immediately retry. To lessen the likelihood of retries, we can send the
- * request and wait for a small amount of time for the server to process it
- * before reading the response.
+ * When sending ICE or DTLS messages, responses are received via UDP. However, the peer
+ * may not be ready and return EAGAIN, in which case we should wait for a short duration
+ * and retry reading.
+ * For instance, if we try to read from UDP and get EAGAIN, we sleep for 5ms and retry.
+ * This macro is used to limit the total duration in milliseconds (e.g., 50ms), so we
+ * will try at most 5 times.
+ * Keep in mind that this macro should have a minimum duration of 5 ms.
  */
-#define ICE_PROCESSING_TIMEOUT 10
-/**
- * Wait for a short timeout in milliseconds to allow the server to process
- * the Datagram Transport Layer Security (DTLS) request. If we immediately
- * read the response after sending the request, we may receive nothing and
- * need to immediately retry. To reduce the likelihood of retries, we can
- * send the request and wait a short amount of time for the server to
- * process it before attempting to read the response.
- */
-#define DTLS_PROCESSING_TIMEOUT 30
-/**
- * The maximum number of retries for Datagram Transport Layer Security (DTLS) EAGAIN errors.
- * When we send a DTLS request and receive no response, we may encounter an EAGAIN error.
- * In this situation, we wait briefly and attempt to read the response again.
- * We limit the maximum number of times we retry this loop.
- */
-#define DTLS_EAGAIN_RETRIES_MAX 5
-
-/**
- * The DTLS timer's base timeout in microseconds. Its purpose is to minimize the unnecessary
- * retransmission of ClientHello.
- */
-#define DTLS_SSL_TIMER_BASE 400 * 1000
+#define ICE_DTLS_READ_INTERVAL 50
 
 /* The magic cookie for Session Traversal Utilities for NAT (STUN) messages. */
 #define STUN_MAGIC_COOKIE 0x2112A442
@@ -201,15 +180,11 @@ typedef struct DTLSContext {
     uint8_t dtls_last_content_type;
     uint8_t dtls_last_handshake_type;
 
-    /* The maximum number of retries for DTLS transmission. */
-    int dtls_arq_max;
-    /* The step start timeout in ms for DTLS transmission. */
-    int dtls_arq_timeout;
     /**
      * The size of RTP packet, should generally be set to MTU.
      * Note that pion requires a smaller value, for example, 1200.
      */
-    int pkt_size;
+    int mtu;
 } DTLSContext;
 
 static int is_dtls_packet(char *buf, int buf_size) {
@@ -613,9 +588,9 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
      * packet is split to ensure that each handshake packet is smaller than the MTU.
      */
     SSL_set_options(dtls, SSL_OP_NO_QUERY_MTU);
-    SSL_set_mtu(dtls, ctx->pkt_size);
+    SSL_set_mtu(dtls, ctx->mtu);
 #if OPENSSL_VERSION_NUMBER >= 0x100010b0L /* OpenSSL 1.0.1k */
-    DTLS_set_link_mtu(dtls, ctx->pkt_size);
+    DTLS_set_link_mtu(dtls, ctx->mtu);
 #endif
 
     bio_in = ctx->bio_in = BIO_new(BIO_s_mem());
@@ -681,7 +656,7 @@ static av_cold int dtls_context_init(DTLSContext *ctx)
         return ret;
     }
 
-    av_log(s1, AV_LOG_INFO, "DTLS: Setup ok, MTU=%d, fingerprint %s\n", ctx->pkt_size, ctx->dtls_fingerprint);
+    av_log(s1, AV_LOG_INFO, "DTLS: Setup ok, MTU=%d, fingerprint %s\n", ctx->mtu, ctx->dtls_fingerprint);
 
     return ret;
 }
@@ -916,14 +891,8 @@ typedef struct RTCContext {
     /* The buffer for UDP transmission. */
     char buf[MAX_UDP_BUFFER_SIZE];
 
-    /* The maximum number of retries for ICE transmission. */
-    int ice_arq_max;
-    /* The step start timeout in ms for ICE transmission. */
-    int ice_arq_timeout;
-    /* The maximum number of retries for DTLS transmission. */
-    int dtls_arq_max;
-    /* The step start timeout in ms for DTLS transmission. */
-    int dtls_arq_timeout;
+    /* The timeout in milliseconds for ICE and DTLS handshake. */
+    int handshake_timeout;
     /**
      * The size of RTP packet, should generally be set to MTU.
      * Note that pion requires a smaller value, for example, 1200.
@@ -999,9 +968,7 @@ static av_cold int whip_init(AVFormatContext *s)
 
     /* Use the same logging context as AV format. */
     rtc->dtls_ctx.log_avcl = s;
-    rtc->dtls_ctx.dtls_arq_max = rtc->dtls_arq_max;
-    rtc->dtls_ctx.dtls_arq_timeout = rtc->dtls_arq_timeout;
-    rtc->dtls_ctx.pkt_size = rtc->pkt_size;
+    rtc->dtls_ctx.mtu = rtc->pkt_size;
     rtc->dtls_ctx.opaque = s;
     rtc->dtls_ctx.on_state = dtls_context_on_state;
     rtc->dtls_ctx.on_write = dtls_context_on_write;
@@ -1013,8 +980,8 @@ static av_cold int whip_init(AVFormatContext *s)
 
     if (rtc->state < RTC_STATE_INIT)
         rtc->state = RTC_STATE_INIT;
-    av_log(s, AV_LOG_INFO, "WHIP: Init state=%d, ice_arq_max=%d, ice_arq_timeout=%d, dtls_arq_max=%d, dtls_arq_timeout=%d pkt_size=%d\n",
-        rtc->state, rtc->ice_arq_max, rtc->ice_arq_timeout, rtc->dtls_arq_max, rtc->dtls_arq_timeout, rtc->pkt_size);
+    av_log(s, AV_LOG_INFO, "WHIP: Init state=%d, handshake_timeout=%d, pkt_size=%d\n",
+        rtc->state, rtc->handshake_timeout, rtc->pkt_size);
 
     if (rtc->pkt_size < ideal_pkt_size)
         av_log(s, AV_LOG_WARNING, "WHIP: pkt_size=%d(<%d) is too small, may cause packet loss\n",
@@ -1808,6 +1775,7 @@ static int udp_connect(AVFormatContext *s)
 static int ice_dtls_handshake(AVFormatContext *s)
 {
     int ret = 0, size, i;
+    int64_t starttime = av_gettime();
     RTCContext *rtc = s->priv_data;
 
     if (rtc->state < RTC_STATE_UDP_CONNECTED || !rtc->udp_uc) {
@@ -1832,13 +1800,21 @@ static int ice_dtls_handshake(AVFormatContext *s)
 
             if (rtc->state < RTC_STATE_ICE_CONNECTING)
                 rtc->state = RTC_STATE_ICE_CONNECTING;
-        } else if (rtc->state >= RTC_STATE_DTLS_FINISHED)
+        }
+
+next_packet:
+        if (rtc->state >= RTC_STATE_DTLS_FINISHED)
             /* DTLS handshake is done, exit the loop. */
             break;
 
-fast_next_packet:
+        if (av_gettime() - starttime >= rtc->handshake_timeout * 1000) {
+            av_log(s, AV_LOG_ERROR, "WHIP: DTLS handshake timeout=%dms, state=%d\n", rtc->handshake_timeout, rtc->state);
+            ret = AVERROR(ETIMEDOUT);
+            goto end;
+        }
+
         /* Read the STUN or DTLS messages from peer. */
-        for (i = 0; i < 10; i++) {
+        for (i = 0; i < ICE_DTLS_READ_INTERVAL / 5; i++) {
             ret = ffurl_read(rtc->udp_uc, rtc->buf, sizeof(rtc->buf));
             if (ret > 0)
                 break;
@@ -1849,6 +1825,10 @@ fast_next_packet:
             av_log(s, AV_LOG_ERROR, "Failed to read message\n");
             goto end;
         }
+
+        /* Got nothing, continue to process handshake. */
+        if (ret <= 0)
+            continue;
 
         /* Handle the ICE binding response. */
         if (ice_is_binding_response(rtc->buf, ret)) {
@@ -1862,24 +1842,21 @@ fast_next_packet:
                 if ((ret = dtls_context_start(&rtc->dtls_ctx)) < 0)
                     goto end;
             }
-            goto fast_next_packet;
+            goto next_packet;
         }
 
         /* When a binding request is received, it is necessary to respond immediately. */
         if (ice_is_binding_request(rtc->buf, ret)) {
             if ((ret = ice_handle_binding_request(s, rtc->buf, ret)) < 0)
                 goto end;
-            goto fast_next_packet;
+            goto next_packet;
         }
 
         /* If got any DTLS messages, handle it. */
         if (is_dtls_packet(rtc->buf, ret)) {
             if ((ret = dtls_context_write(&rtc->dtls_ctx, rtc->buf, ret)) < 0)
                 goto end;
-            if (rtc->state >= RTC_STATE_DTLS_FINISHED)
-                /* DTLS handshake is done, exit the loop. */
-                break;
-            goto fast_next_packet;
+            goto next_packet;
         }
     }
 
@@ -2387,10 +2364,7 @@ static av_cold void rtc_deinit(AVFormatContext *s)
 #define OFFSET(x) offsetof(RTCContext, x)
 #define DEC AV_OPT_FLAG_DECODING_PARAM
 static const AVOption options[] = {
-    { "ice_arq_max",        "Maximum number of retransmissions for the ICE ARQ mechanism",      OFFSET(ice_arq_max),        AV_OPT_TYPE_INT,    { .i64 = 5 },       -1, INT_MAX, DEC },
-    { "ice_arq_timeout",    "Start timeout in milliseconds for the ICE ARQ mechanism",          OFFSET(ice_arq_timeout),    AV_OPT_TYPE_INT,    { .i64 = 30 },      -1, INT_MAX, DEC },
-    { "dtls_arq_max",       "Maximum number of retransmissions for the DTLS ARQ mechanism",     OFFSET(dtls_arq_max),       AV_OPT_TYPE_INT,    { .i64 = 5 },       -1, INT_MAX, DEC },
-    { "dtls_arq_timeout",   "Start timeout in milliseconds for the DTLS ARQ mechanism",         OFFSET(dtls_arq_timeout),   AV_OPT_TYPE_INT,    { .i64 = 50 },      -1, INT_MAX, DEC },
+    { "handshake_timeout",  "Timeout in milliseconds for ICE and DTLS handshake.",              OFFSET(handshake_timeout),  AV_OPT_TYPE_INT,    { .i64 = 5000 },    -1, INT_MAX, DEC },
     { "pkt_size",           "The maximum size, in bytes, of RTP packets that send out",         OFFSET(pkt_size),           AV_OPT_TYPE_INT,    { .i64 = 1200 },    -1, INT_MAX, DEC },
     { "authorization",      "The optional Bearer token for WHIP Authorization",                 OFFSET(authorization),      AV_OPT_TYPE_STRING, { .str = NULL },     0,       0, DEC },
     { NULL },
