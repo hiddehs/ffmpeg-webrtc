@@ -139,7 +139,22 @@ enum StunAttr {
     STUN_ATTR_FINGERPRINT               = 0x8028, /// rfc5389
 };
 
+enum DTLSState {
+    DTLS_STATE_NONE,
+
+    /* Whether DTLS handshake is finished. */
+    DTLS_STATE_FINISHED,
+    /* TODO: FIXME: Handle failed. */
+};
+
+typedef struct DTLSContext DTLSContext;
+typedef int (*DTLSContext_callback_fn)(DTLSContext *b, enum DTLSState state);
+
 typedef struct DTLSContext {
+    /* For callback. */
+    DTLSContext_callback_fn callback;
+    void* opaque;
+
     /* For av_log to write log to this category. */
     void *log_avcl;
 
@@ -168,8 +183,12 @@ typedef struct DTLSContext {
 
     /* Whether the DTLS is done at least for us. */
     int dtls_done_for_us;
+    /* Whether the SRTP key is exported. */
+    int dtls_srtp_key_exported;
     /* The number of packets retransmitted for DTLS. */
     int dtls_arq_packets;
+    /* The time when the DTLS handshake starts. */
+    int64_t dtls_starttime;
     /**
      * This is the last DTLS content type and handshake type that is used to detect
      * the ARQ packet.
@@ -190,6 +209,10 @@ typedef struct DTLSContext {
      */
     int pkt_size;
 } DTLSContext;
+
+static int is_dtls_packet(char *buf, int buf_size) {
+    return buf_size > 13 && buf[0] > 19 && buf[0] < 64;
+}
 
 /**
  * Callback function to print the OpenSSL SSL status.
@@ -676,6 +699,8 @@ static int dtls_context_start_handshake(DTLSContext *ctx)
         return AVERROR(EIO);
     }
 
+    ctx->dtls_starttime = av_gettime();
+
     /* Setup DTLS as passive, which is server role. */
     SSL_set_accept_state(dtls);
 
@@ -711,92 +736,67 @@ static int dtls_context_start_handshake(DTLSContext *ctx)
  *
  * @return 0 if OK, AVERROR_xxx on error
  */
-static int dtls_context_do_handshake(DTLSContext *ctx)
+static int dtls_context_handle_message(DTLSContext *ctx, char* buf, int size)
 {
-    int ret = 0, loop, res_ct, res_ht, r0, r1;
+    int ret = 0, res_ct, res_ht, r0, r1, do_callback;
     SSL *dtls = ctx->dtls;
     const char* dst = "EXTRACTOR-dtls_srtp";
     BIO *bio_in = ctx->bio_in;
-    int64_t starttime = av_gettime();
     void *s1 = ctx->log_avcl;
-    char buf[MAX_UDP_BUFFER_SIZE];
     char detail_error[256];
 
-    av_usleep(800 * 1000);
+    /* Got DTLS response successfully. */
+    openssl_dtls_state_trace(ctx, buf, size, 1);
+    if ((r0 = BIO_write(bio_in, buf, size)) <= 0) {
+        res_ct = size > 0 ? buf[0]: 0;
+        res_ht = size > 13 ? buf[13] : 0;
+        av_log(s1, AV_LOG_ERROR, "DTLS: Feed response failed, content=%d, handshake=%d, size=%d, r0=%d\n",
+            res_ct, res_ht, size, r0);
+        ret = AVERROR(EIO);
+        goto end;
+    }
 
-    /* Receive DTLS message from peer and drive the DTLS context. */
-    for (loop = 0; loop < DTLS_EAGAIN_RETRIES_MAX && !ctx->dtls_done_for_us;) {
-        ret = ffurl_read(ctx->udp_uc, buf, sizeof(buf));
-
-        /* Ignore other packets, such as ICE indication, except DTLS. */
-        if (ret > 0 && (ret < 13 || buf[0] <= 19 || buf[0] >= 64))
-            continue;
-
-        /* Fatal error or timeout. */
-        if (ret <= 0) {
-            if (ret == AVERROR(EAGAIN)) {
-                loop++;
-                av_usleep(50 * 1000);
-                continue;
-            }
-            av_log(s1, AV_LOG_ERROR, "DTLS: Read response failed, loop=%d\n", loop);
+    /**
+     * If there is data available in bio_in, use SSL_read to allow SSL to process it.
+     * We limit the MTU to 1200 for DTLS handshake, which ensures that the buffer is large enough for reading.
+     */
+    r0 = SSL_read(dtls, buf, sizeof(buf));
+    r1 = SSL_get_error(dtls, r0);
+    if (r0 < 0 && r1 == SSL_ERROR_SSL)
+        ERR_error_string_n(ERR_get_error(), detail_error, sizeof(detail_error));
+    ERR_clear_error();
+    if (r0 <= 0) {
+        if (r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE && r1 != SSL_ERROR_ZERO_RETURN) {
+            av_log(s1, AV_LOG_ERROR, "DTLS: Read failed, r0=%d, r1=%d %s\n", r0, r1, detail_error);
+            ret = AVERROR(EIO);
             goto end;
         }
+    } else {
+        av_log(s1, AV_LOG_TRACE, "DTLS: Read %d bytes, r0=%d, r1=%d\n", r0, r0, r1);
+    }
 
-        /* Got DTLS response successfully. */
-        openssl_dtls_state_trace(ctx, buf, ret, 1);
-        if ((r0 = BIO_write(bio_in, buf, ret)) <= 0) {
-            res_ct = ret > 0 ? buf[0]: 0;
-            res_ht = ret > 13 ? buf[13] : 0;
-            av_log(s1, AV_LOG_ERROR, "DTLS: Feed response failed, loop=%d, content=%d, handshake=%d, size=%d, r0=%d\n",
-                loop, res_ct, res_ht, ret, r0);
+    /* Check whether the DTLS is completed. */
+    if (SSL_is_init_finished(dtls) != 1)
+        goto end;
+
+    do_callback = ctx->callback && !ctx->dtls_done_for_us;
+    ctx->dtls_done_for_us = 1;
+
+    /* Export SRTP master key after DTLS done */
+    if (!ctx->dtls_srtp_key_exported) {
+        ret = SSL_export_keying_material(dtls, ctx->dtls_srtp_material, sizeof(ctx->dtls_srtp_material),
+            dst, strlen(dst), NULL, 0, 0);
+        if (!ret) {
+            av_log(s1, AV_LOG_ERROR, "DTLS: SSL export key r0=%lu, ret=%d\n", ERR_get_error(), ret);
             ret = AVERROR(EIO);
             goto end;
         }
 
-        /**
-         * If there is data available in bio_in, use SSL_read to allow SSL to process it.
-         * We limit the MTU to 1200 for DTLS handshake, which ensures that the buffer is large enough for reading.
-         */
-        r0 = SSL_read(dtls, buf, sizeof(buf));
-        r1 = SSL_get_error(dtls, r0);
-        if (r0 < 0 && r1 == SSL_ERROR_SSL)
-            ERR_error_string_n(ERR_get_error(), detail_error, sizeof(detail_error));
-        ERR_clear_error();
-        if (r0 <= 0) {
-            if (r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE && r1 != SSL_ERROR_ZERO_RETURN) {
-                av_log(s1, AV_LOG_ERROR, "DTLS: Read failed, loop=%d, r0=%d, r1=%d %s\n", loop, r0, r1, detail_error);
-                ret = AVERROR(EIO);
-                goto end;
-            }
-        } else {
-            av_log(s1, AV_LOG_TRACE, "DTLS: Read %d bytes, loop=%d, r0=%d, r1=%d\n", r0, loop, r0, r1);
-        }
-
-        // Check whether the DTLS is completed.
-        if (!ctx->dtls_done_for_us && SSL_is_init_finished(dtls) == 1) {
-            ctx->dtls_done_for_us = 1;
-        }
+        ctx->dtls_srtp_key_exported = 1;
     }
 
-    if (!ctx->dtls_done_for_us) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: Handshake failed, loop=%d\n", loop);
-        ret = AVERROR(EIO);
+    if (do_callback && (ret = ctx->callback(ctx, DTLS_STATE_FINISHED)) < 0)
         goto end;
-    }
-
-    /* Export SRTP master key after DTLS done */
-    ret = SSL_export_keying_material(dtls, ctx->dtls_srtp_material, sizeof(ctx->dtls_srtp_material),
-        dst, strlen(dst), NULL, 0, 0);
-    if (!ret) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: SSL export key r0=%lu, ret=%d\n", ERR_get_error(), ret);
-        ret = AVERROR(EIO);
-        goto end;
-    }
-
-    av_log(s1, AV_LOG_INFO, "WHIP: DTLS handshake done=%d, arq=%d, srtp_material=%luB, cost=%dms\n",
-        ctx->dtls_done_for_us, ctx->dtls_arq_packets, sizeof(ctx->dtls_srtp_material),
-        (int)(av_gettime() - starttime) / 1000);
 
 end:
     return ret;
@@ -921,6 +921,25 @@ typedef struct RTCContext {
 static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size);
 
 /**
+ * When DTLS state change.
+ */
+static int dtls_context_callback(DTLSContext *ctx, enum DTLSState state)
+{
+    int ret = 0;
+    AVFormatContext *s = ctx->opaque;
+    RTCContext *rtc = s->priv_data;
+
+    if (state == DTLS_STATE_FINISHED && rtc->state < RTC_STATE_DTLS_FINISHED) {
+        rtc->state = RTC_STATE_DTLS_FINISHED;
+        av_log(s, AV_LOG_INFO, "WHIP: DTLS handshake, done=%d, exported=%d, arq=%d, srtp_material=%luB, cost=%dms\n",
+            ctx->dtls_done_for_us, ctx->dtls_srtp_key_exported, ctx->dtls_arq_packets, sizeof(ctx->dtls_srtp_material),
+            (int)(av_gettime() - ctx->dtls_starttime)/1000);
+    }
+
+    return ret;
+}
+
+/**
  * Initialize and check the options for the WebRTC muxer.
  */
 static av_cold int whip_init(AVFormatContext *s)
@@ -933,6 +952,8 @@ static av_cold int whip_init(AVFormatContext *s)
     rtc->dtls_ctx.dtls_arq_max = rtc->dtls_arq_max;
     rtc->dtls_ctx.dtls_arq_timeout = rtc->dtls_arq_timeout;
     rtc->dtls_ctx.pkt_size = rtc->pkt_size;
+    rtc->dtls_ctx.opaque = s;
+    rtc->dtls_ctx.callback = dtls_context_callback;
 
     if ((ret = dtls_context_init(&rtc->dtls_ctx)) < 0) {
         av_log(s, AV_LOG_ERROR, "WHIP: Failed to init DTLS context\n");
@@ -1737,111 +1758,84 @@ static int udp_connect(AVFormatContext *s)
     return ret;
 }
 
-/**
- * Opens the UDP transport and completes the ICE handshake, using fast retransmit to
- * handle packet loss for the binding request.
- *
- * To initiate a fast retransmission of the STUN binding request during ICE, we wait only
- * for a successful local ICE process i.e., when a binding response is received from the
- * server. Since the server's binding request may not arrive, we do not always wait for it.
- * However, we will always respond to the server's binding request during ICE, DTLS or
- * RTP streaming.
- *
- * @param s Pointer to the AVFormatContext
- * @return Returns 0 if the handshake was successful or AVERROR_xxx in case of an error
- */
-static int ice_handshake(AVFormatContext *s)
+static int ice_dtls_handshake(AVFormatContext *s)
 {
-    int ret, size;
+    int ret = 0, size, i;
     char req_buf[MAX_UDP_BUFFER_SIZE], res_buf[MAX_UDP_BUFFER_SIZE];
     RTCContext *rtc = s->priv_data;
-    int fast_retries = rtc->ice_arq_max, timeout = rtc->ice_arq_timeout;
 
-    /* Build the STUN binding request. */
-    ret = ice_create_request(s, req_buf, sizeof(req_buf), &size);
-    if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to create STUN binding request, size=%d\n", size);
-        goto end;
+    if (rtc->state < RTC_STATE_UDP_CONNECTED || !rtc->udp_uc) {
+        av_log(s, AV_LOG_ERROR, "WHIP: UDP not connected, state=%d, udp_uc=%p\n", rtc->state, rtc->udp_uc);
+        return AVERROR(EINVAL);
     }
 
-    /* Fast retransmit the STUN binding request. */
     while (1) {
-        ret = ffurl_write(rtc->udp_uc, req_buf, size);
-        if (ret < 0) {
-            av_log(s, AV_LOG_ERROR, "Failed to send STUN binding request, size=%d\n", size);
-            goto end;
-        }
-
-        if (rtc->state < RTC_STATE_ICE_CONNECTING)
-            rtc->state = RTC_STATE_ICE_CONNECTING;
-
-        /* Wait so that the server can process the request and no need ARQ then. */
-#if ICE_PROCESSING_TIMEOUT > 0
-        av_usleep(ICE_PROCESSING_TIMEOUT * 10000);
-#endif
-
-        /* Read the STUN binding response. */
-        ret = ffurl_read(rtc->udp_uc, res_buf, sizeof(res_buf));
-        if (ret < 0) {
-            /* If max retries is 6 and start timeout is 21ms, the total timeout
-             * is about 21 + 42 + 84 + 168 + 336 + 672 = 1263ms. */
-            av_usleep(timeout * 1000);
-            timeout *= 2;
-
-            if (ret == AVERROR(EAGAIN) && fast_retries) {
-                fast_retries--;
-                continue;
+        if (rtc->state <= RTC_STATE_ICE_CONNECTING) {
+            /* Build the STUN binding request. */
+            ret = ice_create_request(s, req_buf, sizeof(req_buf), &size);
+            if (ret < 0) {
+                av_log(s, AV_LOG_ERROR, "Failed to create STUN binding request, size=%d\n", size);
+                goto end;
             }
 
-            av_log(s, AV_LOG_ERROR, "Failed to read STUN binding response, retries=%d\n", rtc->ice_arq_max);
-            goto end;
-        }
+            ret = ffurl_write(rtc->udp_uc, req_buf, size);
+            if (ret < 0) {
+                av_log(s, AV_LOG_ERROR, "Failed to send STUN binding request, size=%d\n", size);
+                goto end;
+            }
 
-        /* If got any binding response, the fast retransmission is done. */
-        if (ice_is_binding_response(res_buf, ret)) {
-            if (rtc->state < RTC_STATE_ICE_CONNECTED)
-                rtc->state = RTC_STATE_ICE_CONNECTED;
+            if (rtc->state < RTC_STATE_ICE_CONNECTING)
+                rtc->state = RTC_STATE_ICE_CONNECTING;
+        } else if (rtc->state >= RTC_STATE_DTLS_FINISHED)
+            /* DTLS handshake is done, exit the loop. */
             break;
-        }
 
-        /* When a binding request is received, it is necessary to respond immediately. */
-        if (ice_is_binding_request(res_buf, ret) && (ret = ice_handle_binding_request(s, res_buf, ret)) < 0)
-            goto end;
-    }
-
-    /* Wait just for a small while to get the possible binding request from server. */
-    fast_retries = rtc->ice_arq_max / 2;
-    timeout = rtc->ice_arq_timeout;
-    while (fast_retries) {
-        ret = ffurl_read(rtc->udp_uc, res_buf, sizeof(res_buf));
-        if (ret < 0) {
-            /* If max retries is 6 and start timeout is 21ms, the total timeout
-             * is about 21 + 42 + 84 = 147ms. */
-            av_usleep(timeout * 1000);
-            timeout *= 2;
-
+fast_next_packet:
+        /* Read the STUN or DTLS messages from peer. */
+        for (i = 0; i < 10; i++) {
+            ret = ffurl_read(rtc->udp_uc, res_buf, sizeof(res_buf));
+            if (ret > 0)
+                break;
             if (ret == AVERROR(EAGAIN)) {
-                fast_retries--;
+                av_usleep(5 * 1000);
                 continue;
             }
-
-            av_log(s, AV_LOG_ERROR, "Failed to read STUN binding request, retries=%d\n", rtc->ice_arq_max);
+            av_log(s, AV_LOG_ERROR, "Failed to read message\n");
             goto end;
+        }
+
+        /* Handle the ICE binding response. */
+        if (ice_is_binding_response(res_buf, ret)) {
+            if (rtc->state < RTC_STATE_ICE_CONNECTED) {
+                rtc->state = RTC_STATE_ICE_CONNECTED;
+                av_log(s, AV_LOG_INFO, "WHIP: ICE STUN ok, state=%d, url=udp://%s:%d, location=%s, username=%s:%s, res=%dB\n",
+                    rtc->state, rtc->ice_host, rtc->ice_port, rtc->whip_resource_url ? rtc->whip_resource_url : "",
+                    rtc->ice_ufrag_remote, rtc->ice_ufrag_local, ret);
+
+                /* If got the first binding response, start DTLS handshake. */
+                if ((ret = dtls_context_start_handshake(&rtc->dtls_ctx)) < 0)
+                    goto end;
+            }
+            goto fast_next_packet;
         }
 
         /* When a binding request is received, it is necessary to respond immediately. */
         if (ice_is_binding_request(res_buf, ret)) {
             if ((ret = ice_handle_binding_request(s, res_buf, ret)) < 0)
                 goto end;
-            break;
+            goto fast_next_packet;
+        }
+
+        /* If got any DTLS messages, handle it. */
+        if (is_dtls_packet(res_buf, ret)) {
+            if ((ret = dtls_context_handle_message(&rtc->dtls_ctx, res_buf, ret)) < 0)
+                goto end;
+            if (rtc->state >= RTC_STATE_DTLS_FINISHED)
+                /* DTLS handshake is done, exit the loop. */
+                break;
+            goto fast_next_packet;
         }
     }
-
-    av_log(s, AV_LOG_INFO, "WHIP: ICE STUN ok, state=%d, url=udp://%s:%d, location=%s, username=%s:%s, req=%dB, res=%dB, arq=%d\n",
-        rtc->state, rtc->ice_host, rtc->ice_port, rtc->whip_resource_url ? rtc->whip_resource_url : "",
-        rtc->ice_ufrag_remote, rtc->ice_ufrag_local, size, ret,
-        rtc->ice_arq_max - fast_retries);
-    ret = 0;
 
 end:
     return ret;
@@ -1863,10 +1857,6 @@ static int setup_srtp(AVFormatContext *s)
     char buf[AV_BASE64_SIZE(DTLS_SRTP_MASTER_KEY_LEN)];
     const char* suite = "AES_CM_128_HMAC_SHA1_80";
     RTCContext *rtc = s->priv_data;
-
-    /* TODO: FIXME: Do it in DTLS callback. */
-    if (rtc->state < RTC_STATE_DTLS_FINISHED)
-        rtc->state = RTC_STATE_DTLS_FINISHED;
 
     /* As DTLS client, the send key is client master key plus salt. */
     memcpy(send_key, rtc->dtls_ctx.dtls_srtp_material, 16);
@@ -2231,13 +2221,7 @@ static av_cold int rtc_init(AVFormatContext *s)
     if ((ret = udp_connect(s)) < 0)
         goto end;
 
-    if ((ret = ice_handshake(s)) < 0)
-        goto end;
-
-    if ((ret = dtls_context_start_handshake(&rtc->dtls_ctx)) < 0)
-        goto end;
-
-    if ((ret = dtls_context_do_handshake(&rtc->dtls_ctx)) < 0)
+    if ((ret = ice_dtls_handshake(s)) < 0)
         goto end;
 
     if ((ret = setup_srtp(s)) < 0)
