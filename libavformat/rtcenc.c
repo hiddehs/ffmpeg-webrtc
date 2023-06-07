@@ -111,10 +111,10 @@
 #define STUN_MAGIC_COOKIE 0x2112A442
 
 /* Calculate the elapsed time from starttime to endtime in milliseconds. */
-#define RTC_ELAPSED(starttime, endtime) ((int)(endtime - starttime) / 1000)
+#define ELAPSED(starttime, endtime) ((int)(endtime - starttime) / 1000)
 
 /* STUN Attribute, comprehension-required range (0x0000-0x7FFF) */
-enum StunAttr {
+enum STUNAttr {
     STUN_ATTR_USERNAME                  = 0x0006, /// shared secret response/bind request
     STUN_ATTR_USE_CANDIDATE             = 0x0025, /// bind request
     STUN_ATTR_MESSAGE_INTEGRITY         = 0x0008, /// bind request/response
@@ -667,7 +667,7 @@ static av_cold int dtls_context_init(DTLSContext *ctx)
 
     ctx->dtls_init_endtime = av_gettime();
     av_log(s1, AV_LOG_INFO, "DTLS: Setup ok, MTU=%d, cost=%dms, fingerprint %s\n",
-        ctx->mtu, RTC_ELAPSED(ctx->dtls_init_starttime, av_gettime()), ctx->dtls_fingerprint);
+        ctx->mtu, ELAPSED(ctx->dtls_init_starttime, av_gettime()), ctx->dtls_fingerprint);
 
     return ret;
 }
@@ -942,7 +942,7 @@ static int dtls_context_on_state(DTLSContext *ctx, enum DTLSState state, const c
     if (state == DTLS_STATE_CLOSED) {
         rtc->dtls_closed = 1;
         av_log(s, AV_LOG_INFO, "WHIP: DTLS session closed, type=%s, desc=%s, elapsed=%dms\n",
-            type ? type : "", desc ? desc : "", RTC_ELAPSED(rtc->rtc_starttime, av_gettime()));
+            type ? type : "", desc ? desc : "", ELAPSED(rtc->rtc_starttime, av_gettime()));
         return ret;
     }
 
@@ -959,8 +959,8 @@ static int dtls_context_on_state(DTLSContext *ctx, enum DTLSState state, const c
         rtc->rtc_dtls_time = av_gettime();
         av_log(s, AV_LOG_INFO, "WHIP: DTLS handshake, done=%d, exported=%d, arq=%d, srtp_material=%luB, cost=%dms, elapsed=%dms\n",
             ctx->dtls_done_for_us, ctx->dtls_srtp_key_exported, ctx->dtls_arq_packets, sizeof(ctx->dtls_srtp_material),
-            RTC_ELAPSED(ctx->dtls_handshake_starttime, ctx->dtls_handshake_endtime),
-            RTC_ELAPSED(rtc->rtc_starttime, av_gettime()));
+            ELAPSED(ctx->dtls_handshake_starttime, ctx->dtls_handshake_endtime),
+            ELAPSED(rtc->rtc_starttime, av_gettime()));
         return ret;
     }
 
@@ -1013,7 +1013,7 @@ static av_cold int whip_init(AVFormatContext *s)
         rtc->state = RTC_STATE_INIT;
     rtc->rtc_init_time = av_gettime();
     av_log(s, AV_LOG_INFO, "WHIP: Init state=%d, handshake_timeout=%dms, pkt_size=%d, elapsed=%dms\n",
-        rtc->state, rtc->handshake_timeout, rtc->pkt_size, RTC_ELAPSED(rtc->rtc_starttime, av_gettime()));
+        rtc->state, rtc->handshake_timeout, rtc->pkt_size, ELAPSED(rtc->rtc_starttime, av_gettime()));
 
     return 0;
 }
@@ -1546,7 +1546,7 @@ static int parse_answer(AVFormatContext *s)
     rtc->rtc_answer_time = av_gettime();
     av_log(s, AV_LOG_INFO, "WHIP: SDP state=%d, offer=%luB, answer=%luB, ufrag=%s, pwd=%luB, transport=%s://%s:%d, elapsed=%dms\n",
         rtc->state, strlen(rtc->sdp_offer), strlen(rtc->sdp_answer), rtc->ice_ufrag_remote, strlen(rtc->ice_pwd_remote),
-        rtc->ice_protocol, rtc->ice_host, rtc->ice_port, RTC_ELAPSED(rtc->rtc_starttime, av_gettime()));
+        rtc->ice_protocol, rtc->ice_host, rtc->ice_port, ELAPSED(rtc->rtc_starttime, av_gettime()));
 
 end:
     avio_context_free(&pb);
@@ -1798,7 +1798,7 @@ static int udp_connect(AVFormatContext *s)
         rtc->state = RTC_STATE_UDP_CONNECTED;
     rtc->rtc_udp_time = av_gettime();
     av_log(s, AV_LOG_VERBOSE, "WHIP: UDP state=%d, elapsed=%dms, connected to udp://%s:%d\n",
-        rtc->state, RTC_ELAPSED(rtc->rtc_starttime, av_gettime()), rtc->ice_host, rtc->ice_port);
+        rtc->state, ELAPSED(rtc->rtc_starttime, av_gettime()), rtc->ice_host, rtc->ice_port);
 
     return ret;
 }
@@ -1841,7 +1841,7 @@ next_packet:
         now = av_gettime();
         if (now - starttime >= rtc->handshake_timeout * 1000) {
             av_log(s, AV_LOG_ERROR, "WHIP: DTLS handshake timeout=%dms, cost=%dms, elapsed=%dms, state=%d\n",
-                rtc->handshake_timeout, RTC_ELAPSED(starttime, now), RTC_ELAPSED(rtc->rtc_starttime, now), rtc->state);
+                rtc->handshake_timeout, ELAPSED(starttime, now), ELAPSED(rtc->rtc_starttime, now), rtc->state);
             ret = AVERROR(ETIMEDOUT);
             goto end;
         }
@@ -1870,7 +1870,7 @@ next_packet:
                 rtc->rtc_ice_time = av_gettime();
                 av_log(s, AV_LOG_INFO, "WHIP: ICE STUN ok, state=%d, url=udp://%s:%d, location=%s, username=%s:%s, res=%dB, elapsed=%dms\n",
                     rtc->state, rtc->ice_host, rtc->ice_port, rtc->whip_resource_url ? rtc->whip_resource_url : "",
-                    rtc->ice_ufrag_remote, rtc->ice_ufrag_local, ret, RTC_ELAPSED(rtc->rtc_starttime, av_gettime()));
+                    rtc->ice_ufrag_remote, rtc->ice_ufrag_local, ret, ELAPSED(rtc->rtc_starttime, av_gettime()));
 
                 /* If got the first binding response, start DTLS handshake. */
                 if ((ret = dtls_context_start(&rtc->dtls_ctx)) < 0)
@@ -1965,7 +1965,7 @@ static int setup_srtp(AVFormatContext *s)
         rtc->state = RTC_STATE_SRTP_FINISHED;
     rtc->rtc_srtp_time = av_gettime();
     av_log(s, AV_LOG_INFO, "WHIP: SRTP setup done, state=%d, suite=%s, key=%luB, elapsed=%dms\n",
-        rtc->state, suite, sizeof(send_key), RTC_ELAPSED(rtc->rtc_starttime, av_gettime()));
+        rtc->state, suite, sizeof(send_key), ELAPSED(rtc->rtc_starttime, av_gettime()));
 
 end:
     return ret;
@@ -2067,15 +2067,15 @@ static int create_rtp_muxer(AVFormatContext *s)
     rtc->rtc_ready_time = av_gettime();
     av_log(s, AV_LOG_INFO, "WHIP: Muxer is ready, state=%d, buffer_size=%d, max_packet_size=%d, "
                            "elapsed=%dms(init:%d,offer:%d,answer:%d,udp:%d,ice:%d,dtls:%d,srtp:%d,ready:%d)\n",
-        rtc->state, buffer_size, max_packet_size, RTC_ELAPSED(rtc->rtc_starttime, av_gettime()),
-        RTC_ELAPSED(rtc->rtc_starttime, rtc->rtc_init_time),
-        RTC_ELAPSED(rtc->rtc_init_time, rtc->rtc_offer_time),
-        RTC_ELAPSED(rtc->rtc_offer_time, rtc->rtc_answer_time),
-        RTC_ELAPSED(rtc->rtc_answer_time, rtc->rtc_udp_time),
-        RTC_ELAPSED(rtc->rtc_udp_time, rtc->rtc_ice_time),
-        RTC_ELAPSED(rtc->rtc_ice_time, rtc->rtc_dtls_time),
-        RTC_ELAPSED(rtc->rtc_dtls_time, rtc->rtc_srtp_time),
-        RTC_ELAPSED(rtc->rtc_srtp_time, rtc->rtc_ready_time));
+        rtc->state, buffer_size, max_packet_size, ELAPSED(rtc->rtc_starttime, av_gettime()),
+        ELAPSED(rtc->rtc_starttime, rtc->rtc_init_time),
+        ELAPSED(rtc->rtc_init_time, rtc->rtc_offer_time),
+        ELAPSED(rtc->rtc_offer_time, rtc->rtc_answer_time),
+        ELAPSED(rtc->rtc_answer_time, rtc->rtc_udp_time),
+        ELAPSED(rtc->rtc_udp_time, rtc->rtc_ice_time),
+        ELAPSED(rtc->rtc_ice_time, rtc->rtc_dtls_time),
+        ELAPSED(rtc->rtc_dtls_time, rtc->rtc_srtp_time),
+        ELAPSED(rtc->rtc_srtp_time, rtc->rtc_ready_time));
 
 end:
     if (rtp_ctx)
