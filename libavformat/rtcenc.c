@@ -913,6 +913,8 @@ typedef struct RTCContext {
 
     /* The UDP transport is used for delivering ICE, DTLS and SRTP packets. */
     URLContext *udp_uc;
+    /* The buffer for UDP transmission. */
+    char buf[MAX_UDP_BUFFER_SIZE];
 
     /* The maximum number of retries for ICE transmission. */
     int ice_arq_max;
@@ -1730,7 +1732,6 @@ static int ice_is_binding_response(char *buf, int buf_size) {
 static int ice_handle_binding_request(AVFormatContext *s, char *buf, int buf_size) {
     int ret = 0, size;
     char tid[12];
-    uint8_t res_buf[MAX_UDP_BUFFER_SIZE];
     RTCContext *rtc = s->priv_data;
 
     /* Ignore if not a binding request. */
@@ -1746,13 +1747,13 @@ static int ice_handle_binding_request(AVFormatContext *s, char *buf, int buf_siz
     memcpy(tid, buf + 8, 12);
 
     /* Build the STUN binding response. */
-    ret = ice_create_response(s, tid, sizeof(tid), res_buf, sizeof(res_buf), &size);
+    ret = ice_create_response(s, tid, sizeof(tid), rtc->buf, sizeof(rtc->buf), &size);
     if (ret < 0) {
         av_log(s, AV_LOG_ERROR, "Failed to create STUN binding response, size=%d\n", size);
         return ret;
     }
 
-    ret = ffurl_write(rtc->udp_uc, res_buf, size);
+    ret = ffurl_write(rtc->udp_uc, rtc->buf, size);
     if (ret < 0) {
         av_log(s, AV_LOG_ERROR, "Failed to send STUN binding response, size=%d\n", size);
         return ret;
@@ -1807,7 +1808,6 @@ static int udp_connect(AVFormatContext *s)
 static int ice_dtls_handshake(AVFormatContext *s)
 {
     int ret = 0, size, i;
-    char req_buf[MAX_UDP_BUFFER_SIZE], res_buf[MAX_UDP_BUFFER_SIZE];
     RTCContext *rtc = s->priv_data;
 
     if (rtc->state < RTC_STATE_UDP_CONNECTED || !rtc->udp_uc) {
@@ -1818,13 +1818,13 @@ static int ice_dtls_handshake(AVFormatContext *s)
     while (1) {
         if (rtc->state <= RTC_STATE_ICE_CONNECTING) {
             /* Build the STUN binding request. */
-            ret = ice_create_request(s, req_buf, sizeof(req_buf), &size);
+            ret = ice_create_request(s, rtc->buf, sizeof(rtc->buf), &size);
             if (ret < 0) {
                 av_log(s, AV_LOG_ERROR, "Failed to create STUN binding request, size=%d\n", size);
                 goto end;
             }
 
-            ret = ffurl_write(rtc->udp_uc, req_buf, size);
+            ret = ffurl_write(rtc->udp_uc, rtc->buf, size);
             if (ret < 0) {
                 av_log(s, AV_LOG_ERROR, "Failed to send STUN binding request, size=%d\n", size);
                 goto end;
@@ -1839,7 +1839,7 @@ static int ice_dtls_handshake(AVFormatContext *s)
 fast_next_packet:
         /* Read the STUN or DTLS messages from peer. */
         for (i = 0; i < 10; i++) {
-            ret = ffurl_read(rtc->udp_uc, res_buf, sizeof(res_buf));
+            ret = ffurl_read(rtc->udp_uc, rtc->buf, sizeof(rtc->buf));
             if (ret > 0)
                 break;
             if (ret == AVERROR(EAGAIN)) {
@@ -1851,7 +1851,7 @@ fast_next_packet:
         }
 
         /* Handle the ICE binding response. */
-        if (ice_is_binding_response(res_buf, ret)) {
+        if (ice_is_binding_response(rtc->buf, ret)) {
             if (rtc->state < RTC_STATE_ICE_CONNECTED) {
                 rtc->state = RTC_STATE_ICE_CONNECTED;
                 av_log(s, AV_LOG_INFO, "WHIP: ICE STUN ok, state=%d, url=udp://%s:%d, location=%s, username=%s:%s, res=%dB\n",
@@ -1866,15 +1866,15 @@ fast_next_packet:
         }
 
         /* When a binding request is received, it is necessary to respond immediately. */
-        if (ice_is_binding_request(res_buf, ret)) {
-            if ((ret = ice_handle_binding_request(s, res_buf, ret)) < 0)
+        if (ice_is_binding_request(rtc->buf, ret)) {
+            if ((ret = ice_handle_binding_request(s, rtc->buf, ret)) < 0)
                 goto end;
             goto fast_next_packet;
         }
 
         /* If got any DTLS messages, handle it. */
-        if (is_dtls_packet(res_buf, ret)) {
-            if ((ret = dtls_context_handle_message(&rtc->dtls_ctx, res_buf, ret)) < 0)
+        if (is_dtls_packet(rtc->buf, ret)) {
+            if ((ret = dtls_context_handle_message(&rtc->dtls_ctx, rtc->buf, ret)) < 0)
                 goto end;
             if (rtc->state >= RTC_STATE_DTLS_FINISHED)
                 /* DTLS handshake is done, exit the loop. */
@@ -2073,7 +2073,6 @@ static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size)
 {
     int ret, cipher_size, is_rtcp, is_video;
     uint8_t payload_type, nalu_header;
-    char cipher[MAX_UDP_BUFFER_SIZE];
     AVFormatContext *s = opaque;
     RTCContext *rtc = s->priv_data;
     struct SRTPContext *srtp;
@@ -2111,13 +2110,13 @@ static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size)
     srtp = is_rtcp ? &rtc->srtp_rtcp_send : (is_video? &rtc->srtp_video_send : &rtc->srtp_audio_send);
 
     /* Encrypt by SRTP and send out. */
-    cipher_size = ff_srtp_encrypt(srtp, buf, buf_size, cipher, sizeof(cipher));
+    cipher_size = ff_srtp_encrypt(srtp, buf, buf_size, rtc->buf, sizeof(rtc->buf));
     if (cipher_size <= 0 || cipher_size < buf_size) {
         av_log(s, AV_LOG_WARNING, "Failed to encrypt packet=%dB, cipher=%dB\n", buf_size, cipher_size);
         return 0;
     }
 
-    ret = ffurl_write(rtc->udp_uc, cipher, cipher_size);
+    ret = ffurl_write(rtc->udp_uc, rtc->buf, cipher_size);
     if (ret < 0) {
         av_log(s, AV_LOG_ERROR, "Failed to write packet=%dB, ret=%d\n", cipher_size, ret);
         return ret;
