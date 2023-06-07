@@ -2292,8 +2292,21 @@ static int rtc_write_packet(AVFormatContext *s, AVPacket *pkt)
     AVFormatContext *rtp_ctx = st->priv_data;
 
     /* TODO: Send binding request every 1s as WebRTC heartbeat. */
-    /* TODO: Receive packets from the server such as ICE binding requests, DTLS messages,
-     * and RTCP like PLI requests, then respond to them.*/
+
+    /**
+     * Receive packets from the server such as ICE binding requests, DTLS messages,
+     * and RTCP like PLI requests, then respond to them.
+     */
+    ret = ffurl_read(rtc->udp_uc, rtc->buf, sizeof(rtc->buf));
+    if (ret > 0) {
+        if (is_dtls_packet(rtc->buf, ret) && (ret = dtls_context_handle_message(&rtc->dtls_ctx, rtc->buf, ret)) < 0) {
+            av_log(s, AV_LOG_ERROR, "Failed to handle DTLS message\n");
+            goto end;
+        }
+    } else if (ret != AVERROR(EAGAIN)) {
+        av_log(s, AV_LOG_ERROR, "Failed to read from UDP socket\n");
+        goto end;
+    }
 
     /* For audio OPUS stream, correct the timestamp. */
     if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
@@ -2327,6 +2340,8 @@ end:
         rtc->state = RTC_STATE_FAILED;
     if (ret >= 0 && rtc->state >= RTC_STATE_FAILED && rtc->dtls_ret < 0)
         ret = rtc->dtls_ret;
+    if (ret >= 0 && rtc->dtls_closed)
+        ret = AVERROR(EIO);
     return ret;
 }
 
