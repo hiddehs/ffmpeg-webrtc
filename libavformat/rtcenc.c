@@ -687,25 +687,10 @@ static av_cold int dtls_context_init(DTLSContext *ctx)
 }
 
 /**
- * Cleanup the DTLS context.
- */
-static av_cold void dtls_context_deinit(DTLSContext *ctx)
-{
-    SSL_free(ctx->dtls);
-    SSL_CTX_free(ctx->dtls_ctx);
-    X509_free(ctx->dtls_cert);
-    EVP_PKEY_free(ctx->dtls_pkey);
-    av_freep(&ctx->dtls_fingerprint);
-#if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
-    EC_KEY_free(ctx->dtls_eckey);
-#endif
-}
-
-/**
  * Once the DTLS role has been negotiated - active for the DTLS client or passive for the
  * DTLS server - we proceed to set up the DTLS state and initiate the handshake.
  */
-static int dtls_context_start_handshake(DTLSContext *ctx)
+static int dtls_context_start(DTLSContext *ctx)
 {
     int ret = 0, r0, r1;
     SSL *dtls = ctx->dtls;
@@ -749,7 +734,7 @@ static int dtls_context_start_handshake(DTLSContext *ctx)
  *
  * @return 0 if OK, AVERROR_xxx on error
  */
-static int dtls_context_handle_message(DTLSContext *ctx, char* buf, int size)
+static int dtls_context_write(DTLSContext *ctx, char* buf, int size)
 {
     int ret = 0, res_ct, res_ht, r0, r1, do_callback;
     SSL *dtls = ctx->dtls;
@@ -813,6 +798,21 @@ static int dtls_context_handle_message(DTLSContext *ctx, char* buf, int size)
 
 end:
     return ret;
+}
+
+/**
+ * Cleanup the DTLS context.
+ */
+static av_cold void dtls_context_deinit(DTLSContext *ctx)
+{
+    SSL_free(ctx->dtls);
+    SSL_CTX_free(ctx->dtls_ctx);
+    X509_free(ctx->dtls_cert);
+    EVP_PKEY_free(ctx->dtls_pkey);
+    av_freep(&ctx->dtls_fingerprint);
+#if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
+    EC_KEY_free(ctx->dtls_eckey);
+#endif
 }
 
 enum RTCState {
@@ -1859,7 +1859,7 @@ fast_next_packet:
                     rtc->ice_ufrag_remote, rtc->ice_ufrag_local, ret);
 
                 /* If got the first binding response, start DTLS handshake. */
-                if ((ret = dtls_context_start_handshake(&rtc->dtls_ctx)) < 0)
+                if ((ret = dtls_context_start(&rtc->dtls_ctx)) < 0)
                     goto end;
             }
             goto fast_next_packet;
@@ -1874,7 +1874,7 @@ fast_next_packet:
 
         /* If got any DTLS messages, handle it. */
         if (is_dtls_packet(rtc->buf, ret)) {
-            if ((ret = dtls_context_handle_message(&rtc->dtls_ctx, rtc->buf, ret)) < 0)
+            if ((ret = dtls_context_write(&rtc->dtls_ctx, rtc->buf, ret)) < 0)
                 goto end;
             if (rtc->state >= RTC_STATE_DTLS_FINISHED)
                 /* DTLS handshake is done, exit the loop. */
@@ -2298,9 +2298,11 @@ static int rtc_write_packet(AVFormatContext *s, AVPacket *pkt)
      */
     ret = ffurl_read(rtc->udp_uc, rtc->buf, sizeof(rtc->buf));
     if (ret > 0) {
-        if (is_dtls_packet(rtc->buf, ret) && (ret = dtls_context_handle_message(&rtc->dtls_ctx, rtc->buf, ret)) < 0) {
-            av_log(s, AV_LOG_ERROR, "Failed to handle DTLS message\n");
-            goto end;
+        if (is_dtls_packet(rtc->buf, ret)) {
+            if ((ret = dtls_context_write(&rtc->dtls_ctx, rtc->buf, ret)) < 0) {
+                av_log(s, AV_LOG_ERROR, "Failed to handle DTLS message\n");
+                goto end;
+            }
         }
     } else if (ret != AVERROR(EAGAIN)) {
         av_log(s, AV_LOG_ERROR, "Failed to read from UDP socket\n");
