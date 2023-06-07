@@ -144,11 +144,14 @@ enum DTLSState {
 
     /* Whether DTLS handshake is finished. */
     DTLS_STATE_FINISHED,
-    /* TODO: FIXME: Handle failed. */
+    /* Whether DTLS session is closed. */
+    DTLS_STATE_CLOSED,
+    /* Whether DTLS handshake is failed. */
+    DTLS_STATE_FAILED,
 };
 
 typedef struct DTLSContext DTLSContext;
-typedef int (*DTLSContext_on_state_fn)(DTLSContext *ctx, enum DTLSState state);
+typedef int (*DTLSContext_on_state_fn)(DTLSContext *ctx, enum DTLSState state, const char* type, const char* desc);
 typedef int (*DTLSContext_on_write_fn)(DTLSContext *ctx, char* data, int size);
 
 typedef struct DTLSContext {
@@ -216,10 +219,11 @@ static int is_dtls_packet(char *buf, int buf_size) {
 /**
  * Callback function to print the OpenSSL SSL status.
  */
-static void openssl_dtls_on_info(const SSL *dtls, int where, int ret)
+static void openssl_dtls_on_info(const SSL *dtls, int where, int r0)
 {
-    int w, r1;
+    int w, r1, is_fatal, is_warning, is_close_notify;
     const char *method = "undefined", *alert_type, *alert_desc;
+    enum DTLSState state;
     DTLSContext *ctx = (DTLSContext*)SSL_get_ex_data(dtls, 0);
     void *s1 = ctx->log_avcl;
 
@@ -229,33 +233,48 @@ static void openssl_dtls_on_info(const SSL *dtls, int where, int ret)
     else if (w & SSL_ST_ACCEPT)
         method = "SSL_accept";
 
-    r1 = SSL_get_error(dtls, ret);
+    r1 = SSL_get_error(dtls, r0);
     if (where & SSL_CB_LOOP) {
         av_log(s1, AV_LOG_VERBOSE, "DTLS: method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
-            method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, ret, r1);
+            method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, r0, r1);
     } else if (where & SSL_CB_ALERT) {
         method = (where & SSL_CB_READ) ? "read":"write";
 
-        alert_type = SSL_alert_type_string_long(ret);
-        alert_desc = SSL_alert_desc_string(ret);
+        alert_type = SSL_alert_type_string_long(r0);
+        alert_desc = SSL_alert_desc_string(r0);
 
         if (!av_strcasecmp(alert_type, "warning") && !av_strcasecmp(alert_desc, "CN"))
             av_log(s1, AV_LOG_WARNING, "DTLS: SSL3 alert method=%s type=%s, desc=%s(%s), where=%d, ret=%d, r1=%d\n",
-                method, alert_type, alert_desc, SSL_alert_desc_string_long(ret), where, ret, r1);
+                method, alert_type, alert_desc, SSL_alert_desc_string_long(r0), where, r0, r1);
         else
             av_log(s1, AV_LOG_ERROR, "DTLS: SSL3 alert method=%s type=%s, desc=%s(%s), where=%d, ret=%d, r1=%d\n",
-                method, alert_type, alert_desc, SSL_alert_desc_string_long(ret), where, ret, r1);
+                method, alert_type, alert_desc, SSL_alert_desc_string_long(r0), where, r0, r1);
+
+        /**
+         * Notify the DTLS to handle the ALERT message, which maybe means media connection disconnect.
+         * CN(Close Notify) is sent when peer close the PeerConnection. fatal, IP(Illegal Parameter)
+         * is sent when DTLS failed.
+         */
+        is_fatal = !av_strncasecmp(alert_type, "fatal", 5);
+        is_warning = !av_strncasecmp(alert_type, "warning", 7);
+        is_close_notify = !av_strncasecmp(alert_desc, "CN", 2);
+        state = is_fatal ? DTLS_STATE_FAILED : (is_warning && is_close_notify ? DTLS_STATE_CLOSED : DTLS_STATE_NONE);
+        if (state != DTLS_STATE_NONE && ctx->on_state) {
+            av_log(s1, AV_LOG_INFO, "DTLS: Notify ctx=%p, state=%d, fatal=%d, warning=%d, cn=%d\n",
+                ctx, state, is_fatal, is_warning, is_close_notify);
+            ctx->on_state(ctx, state, alert_type, alert_desc);
+        }
     } else if (where & SSL_CB_EXIT) {
-        if (!ret)
+        if (!r0)
             av_log(s1, AV_LOG_WARNING, "DTLS: Fail method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
-                method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, ret, r1);
-        else if (ret < 0)
+                method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, r0, r1);
+        else if (r0 < 0)
             if (r1 != SSL_ERROR_NONE && r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE)
                 av_log(s1, AV_LOG_ERROR, "DTLS: Error method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
-                    method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, ret, r1);
+                    method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, r0, r1);
             else
                 av_log(s1, AV_LOG_VERBOSE, "DTLS: method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
-                    method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, ret, r1);
+                    method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, r0, r1);
     }
 }
 
@@ -789,7 +808,7 @@ static int dtls_context_handle_message(DTLSContext *ctx, char* buf, int size)
         ctx->dtls_srtp_key_exported = 1;
     }
 
-    if (do_callback && (ret = ctx->on_state(ctx, DTLS_STATE_FINISHED)) < 0)
+    if (do_callback && (ret = ctx->on_state(ctx, DTLS_STATE_FINISHED, NULL, NULL)) < 0)
         goto end;
 
 end:
@@ -831,6 +850,9 @@ typedef struct RTCContext {
 
     /* The state of the RTC connection. */
     enum RTCState state;
+    /* The callback return value for DTLS. */
+    int dtls_ret;
+    int dtls_closed;
 
     /* Parameters for the input audio and video codecs. */
     AVCodecParameters *audio_par;
@@ -917,17 +939,33 @@ static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size);
 /**
  * When DTLS state change.
  */
-static int dtls_context_on_state(DTLSContext *ctx, enum DTLSState state)
+static int dtls_context_on_state(DTLSContext *ctx, enum DTLSState state, const char* type, const char* desc)
 {
     int ret = 0;
     AVFormatContext *s = ctx->opaque;
     RTCContext *rtc = s->priv_data;
+
+    if (state == DTLS_STATE_CLOSED) {
+        rtc->dtls_closed = 1;
+        av_log(s, AV_LOG_INFO, "WHIP: DTLS session closed, type=%s, desc=%s\n",
+            type ? type : "", desc ? desc : "");
+        return ret;
+    }
+
+    if (state == DTLS_STATE_FAILED) {
+        rtc->state = RTC_STATE_FAILED;
+        av_log(s, AV_LOG_ERROR, "WHIP: DTLS session failed, type=%s, desc=%s\n",
+            type ? type : "", desc ? desc : "");
+        rtc->dtls_ret = AVERROR(EIO);
+        return ret;
+    }
 
     if (state == DTLS_STATE_FINISHED && rtc->state < RTC_STATE_DTLS_FINISHED) {
         rtc->state = RTC_STATE_DTLS_FINISHED;
         av_log(s, AV_LOG_INFO, "WHIP: DTLS handshake, done=%d, exported=%d, arq=%d, srtp_material=%luB, cost=%dms\n",
             ctx->dtls_done_for_us, ctx->dtls_srtp_key_exported, ctx->dtls_arq_packets, sizeof(ctx->dtls_srtp_material),
             (int)(av_gettime() - ctx->dtls_starttime)/1000);
+        return ret;
     }
 
     return ret;
@@ -2241,6 +2279,8 @@ static av_cold int rtc_init(AVFormatContext *s)
 end:
     if (ret < 0 && rtc->state < RTC_STATE_FAILED)
         rtc->state = RTC_STATE_FAILED;
+    if (ret >= 0 && rtc->state >= RTC_STATE_FAILED && rtc->dtls_ret < 0)
+        ret = rtc->dtls_ret;
     return ret;
 }
 
@@ -2285,6 +2325,8 @@ static int rtc_write_packet(AVFormatContext *s, AVPacket *pkt)
 end:
     if (ret < 0 && rtc->state < RTC_STATE_FAILED)
         rtc->state = RTC_STATE_FAILED;
+    if (ret >= 0 && rtc->state >= RTC_STATE_FAILED && rtc->dtls_ret < 0)
+        ret = rtc->dtls_ret;
     return ret;
 }
 
