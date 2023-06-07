@@ -736,7 +736,7 @@ static int dtls_context_do_handshake(DTLSContext *ctx)
         if (ret <= 0) {
             if (ret == AVERROR(EAGAIN)) {
                 loop++;
-                av_usleep(30 * 1000);
+                av_usleep(50 * 1000);
                 continue;
             }
             av_log(s1, AV_LOG_ERROR, "DTLS: Read response failed, loop=%d\n", loop);
@@ -1649,6 +1649,47 @@ static int ice_handle_binding_request(AVFormatContext *s, char *buf, int buf_siz
 }
 
 /**
+ * To establish a connection with the UDP server, we utilize ICE-LITE in a Client-Server
+ * mode. In this setup, FFmpeg acts as the UDP client, while the peer functions as the
+ * UDP server.
+ */
+static int udp_connect(AVFormatContext *s)
+{
+    int ret = 0;
+    char url[256], tmp[16];
+    RTCContext *rtc = s->priv_data;
+
+    /* Build UDP URL and create the UDP context as transport. */
+    ff_url_join(url, sizeof(url), "udp", NULL, rtc->ice_host, rtc->ice_port, NULL);
+    ret = ffurl_alloc(&rtc->udp_uc, url, AVIO_FLAG_WRITE, &s->interrupt_callback);
+    if (ret < 0) {
+        av_log(s, AV_LOG_ERROR, "Failed to open udp://%s:%d\n", rtc->ice_host, rtc->ice_port);
+        return ret;
+    }
+
+    av_opt_set(rtc->udp_uc->priv_data, "connect", "1", 0);
+    av_opt_set(rtc->udp_uc->priv_data, "fifo_size", "0", 0);
+    /* Set the max packet size to the buffer size. */
+    snprintf(tmp, sizeof(tmp), "%d", rtc->pkt_size);
+    av_opt_set(rtc->udp_uc->priv_data, "pkt_size", tmp, 0);
+
+    ret = ffurl_connect(rtc->udp_uc, NULL);
+    if (ret < 0) {
+        av_log(s, AV_LOG_ERROR, "Failed to connect udp://%s:%d\n", rtc->ice_host, rtc->ice_port);
+        return ret;
+    }
+
+    /* Make the socket non-blocking, set to READ and WRITE mode after connected */
+    ff_socket_nonblock(ffurl_get_file_handle(rtc->udp_uc), 1);
+    rtc->udp_uc->flags |= AVIO_FLAG_READ | AVIO_FLAG_NONBLOCK;
+
+    /* Now UDP URL context is ready, setup the DTLS transport. */
+    rtc->dtls_ctx.udp_uc = rtc->udp_uc;
+
+    return ret;
+}
+
+/**
  * Opens the UDP transport and completes the ICE handshake, using fast retransmit to
  * handle packet loss for the binding request.
  *
@@ -1664,34 +1705,9 @@ static int ice_handle_binding_request(AVFormatContext *s, char *buf, int buf_siz
 static int ice_handshake(AVFormatContext *s)
 {
     int ret, size;
-    char url[256], tmp[16];
     char req_buf[MAX_UDP_BUFFER_SIZE], res_buf[MAX_UDP_BUFFER_SIZE];
     RTCContext *rtc = s->priv_data;
     int fast_retries = rtc->ice_arq_max, timeout = rtc->ice_arq_timeout;
-
-    /* Build UDP URL and create the UDP context as transport. */
-    ff_url_join(url, sizeof(url), "udp", NULL, rtc->ice_host, rtc->ice_port, NULL);
-    ret = ffurl_alloc(&rtc->udp_uc, url, AVIO_FLAG_WRITE, &s->interrupt_callback);
-    if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to open udp://%s:%d\n", rtc->ice_host, rtc->ice_port);
-        goto end;
-    }
-
-    av_opt_set(rtc->udp_uc->priv_data, "connect", "1", 0);
-    av_opt_set(rtc->udp_uc->priv_data, "fifo_size", "0", 0);
-    /* Set the max packet size to the buffer size. */
-    snprintf(tmp, sizeof(tmp), "%d", rtc->pkt_size);
-    av_opt_set(rtc->udp_uc->priv_data, "pkt_size", tmp, 0);
-
-    ret = ffurl_connect(rtc->udp_uc, NULL);
-    if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to connect udp://%s:%d\n", rtc->ice_host, rtc->ice_port);
-        goto end;
-    }
-
-    /* Make the socket non-blocking, set to READ and WRITE mode after connected */
-    ff_socket_nonblock(ffurl_get_file_handle(rtc->udp_uc), 1);
-    rtc->udp_uc->flags |= AVIO_FLAG_READ | AVIO_FLAG_NONBLOCK;
 
     /* Build the STUN binding request. */
     ret = ice_create_request(s, req_buf, sizeof(req_buf), &size);
@@ -2150,11 +2166,11 @@ static av_cold int rtc_init(AVFormatContext *s)
     if ((ret = parse_answer(s)) < 0)
         return ret;
 
-    if ((ret = ice_handshake(s)) < 0)
+    if ((ret = udp_connect(s)) < 0)
         return ret;
 
-    /* Now UDP URL context is ready, setup the DTLS transport. */
-    rtc->dtls_ctx.udp_uc = rtc->udp_uc;
+    if ((ret = ice_handshake(s)) < 0)
+        return ret;
 
     if ((ret = dtls_context_start_handshake(&rtc->dtls_ctx)) < 0)
         return ret;
