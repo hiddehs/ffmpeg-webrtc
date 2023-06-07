@@ -802,8 +802,41 @@ end:
     return ret;
 }
 
+enum RTCState {
+    RTC_STATE_NONE,
+
+    /* The initial state. */
+    RTC_STATE_INIT,
+    /* The muxer has sent the offer to the peer. */
+    RTC_STATE_OFFER,
+    /* The muxer has received the answer from the peer. */
+    RTC_STATE_ANSWER,
+    /**
+     * After parsing the answer received from the peer, the muxer negotiates the abilities
+     * in the offer that it generated.
+     */
+    RTC_STATE_NEGOTIATED,
+    /* The muxer has connected to the peer via UDP. */
+    RTC_STATE_UDP_CONNECTED,
+    /* The muxer has sent the ICE request to the peer. */
+    RTC_STATE_ICE_CONNECTING,
+    /* The muxer has received the ICE response from the peer. */
+    RTC_STATE_ICE_CONNECTED,
+    /* The muxer has finished the DTLS handshake with the peer. */
+    RTC_STATE_DTLS_FINISHED,
+    /* The muxer has finished the SRTP setup. */
+    RTC_STATE_SRTP_FINISHED,
+    /* The muxer is ready to send/receive media frames. */
+    RTC_STATE_READY,
+    /* The muxer is failed. */
+    RTC_STATE_FAILED,
+};
+
 typedef struct RTCContext {
     AVClass *av_class;
+
+    /* The state of the RTC connection. */
+    enum RTCState state;
 
     /* Parameters for the input audio and video codecs. */
     AVCodecParameters *audio_par;
@@ -906,8 +939,10 @@ static av_cold int whip_init(AVFormatContext *s)
         return ret;
     }
 
-    av_log(s, AV_LOG_INFO, "WHIP: Init ice_arq_max=%d, ice_arq_timeout=%d, dtls_arq_max=%d, dtls_arq_timeout=%d pkt_size=%d\n",
-        rtc->ice_arq_max, rtc->ice_arq_timeout, rtc->dtls_arq_max, rtc->dtls_arq_timeout, rtc->pkt_size);
+    if (rtc->state < RTC_STATE_INIT)
+        rtc->state = RTC_STATE_INIT;
+    av_log(s, AV_LOG_INFO, "WHIP: Init state=%d, ice_arq_max=%d, ice_arq_timeout=%d, dtls_arq_max=%d, dtls_arq_timeout=%d pkt_size=%d\n",
+        rtc->state, rtc->ice_arq_max, rtc->ice_arq_timeout, rtc->dtls_arq_max, rtc->dtls_arq_timeout, rtc->pkt_size);
 
     if (rtc->pkt_size < ideal_pkt_size)
         av_log(s, AV_LOG_WARNING, "WHIP: pkt_size=%d(<%d) is too small, may cause packet loss\n",
@@ -1234,7 +1269,10 @@ static int generate_sdp_offer(AVFormatContext *s)
         ret = AVERROR(ENOMEM);
         goto end;
     }
-    av_log(s, AV_LOG_VERBOSE, "WHIP: Generated offer: %s\n", rtc->sdp_offer);
+
+    if (rtc->state < RTC_STATE_OFFER)
+        rtc->state = RTC_STATE_OFFER;
+    av_log(s, AV_LOG_VERBOSE, "WHIP: Generated state=%d, offer: %s\n", rtc->state, rtc->sdp_offer);
 
 end:
     av_bprint_finalize(&bp, NULL);
@@ -1331,7 +1369,10 @@ static int exchange_sdp(AVFormatContext *s)
         ret = AVERROR(ENOMEM);
         goto end;
     }
-    av_log(s, AV_LOG_VERBOSE, "WHIP: Got answer: %s\n", rtc->sdp_answer);
+
+    if (rtc->state < RTC_STATE_ANSWER)
+        rtc->state = RTC_STATE_ANSWER;
+    av_log(s, AV_LOG_VERBOSE, "WHIP: Got state=%d, answer: %s\n", rtc->state, rtc->sdp_answer);
 
 end:
     ffurl_closep(&whip_uc);
@@ -1432,8 +1473,10 @@ static int parse_answer(AVFormatContext *s)
         goto end;
     }
 
-    av_log(s, AV_LOG_INFO, "WHIP: SDP offer=%luB, answer=%luB, ufrag=%s, pwd=%luB, transport=%s://%s:%d\n",
-        strlen(rtc->sdp_offer), strlen(rtc->sdp_answer), rtc->ice_ufrag_remote, strlen(rtc->ice_pwd_remote),
+    if (rtc->state < RTC_STATE_NEGOTIATED)
+        rtc->state = RTC_STATE_NEGOTIATED;
+    av_log(s, AV_LOG_INFO, "WHIP: SDP state=%d, offer=%luB, answer=%luB, ufrag=%s, pwd=%luB, transport=%s://%s:%d\n",
+        rtc->state, strlen(rtc->sdp_offer), strlen(rtc->sdp_answer), rtc->ice_ufrag_remote, strlen(rtc->ice_pwd_remote),
         rtc->ice_protocol, rtc->ice_host, rtc->ice_port);
 
 end:
@@ -1686,6 +1729,11 @@ static int udp_connect(AVFormatContext *s)
     /* Now UDP URL context is ready, setup the DTLS transport. */
     rtc->dtls_ctx.udp_uc = rtc->udp_uc;
 
+    if (rtc->state < RTC_STATE_UDP_CONNECTED)
+        rtc->state = RTC_STATE_UDP_CONNECTED;
+    av_log(s, AV_LOG_VERBOSE, "WHIP: UDP state=%d, connected to udp://%s:%d\n",
+        rtc->state, rtc->ice_host, rtc->ice_port);
+
     return ret;
 }
 
@@ -1724,6 +1772,9 @@ static int ice_handshake(AVFormatContext *s)
             goto end;
         }
 
+        if (rtc->state < RTC_STATE_ICE_CONNECTING)
+            rtc->state = RTC_STATE_ICE_CONNECTING;
+
         /* Wait so that the server can process the request and no need ARQ then. */
 #if ICE_PROCESSING_TIMEOUT > 0
         av_usleep(ICE_PROCESSING_TIMEOUT * 10000);
@@ -1747,8 +1798,11 @@ static int ice_handshake(AVFormatContext *s)
         }
 
         /* If got any binding response, the fast retransmission is done. */
-        if (ice_is_binding_response(res_buf, ret))
+        if (ice_is_binding_response(res_buf, ret)) {
+            if (rtc->state < RTC_STATE_ICE_CONNECTED)
+                rtc->state = RTC_STATE_ICE_CONNECTED;
             break;
+        }
 
         /* When a binding request is received, it is necessary to respond immediately. */
         if (ice_is_binding_request(res_buf, ret) && (ret = ice_handle_binding_request(s, res_buf, ret)) < 0)
@@ -1783,8 +1837,8 @@ static int ice_handshake(AVFormatContext *s)
         }
     }
 
-    av_log(s, AV_LOG_INFO, "WHIP: ICE STUN ok, url=udp://%s:%d, location=%s, username=%s:%s, req=%dB, res=%dB, arq=%d\n",
-        rtc->ice_host, rtc->ice_port, rtc->whip_resource_url ? rtc->whip_resource_url : "",
+    av_log(s, AV_LOG_INFO, "WHIP: ICE STUN ok, state=%d, url=udp://%s:%d, location=%s, username=%s:%s, req=%dB, res=%dB, arq=%d\n",
+        rtc->state, rtc->ice_host, rtc->ice_port, rtc->whip_resource_url ? rtc->whip_resource_url : "",
         rtc->ice_ufrag_remote, rtc->ice_ufrag_local, size, ret,
         rtc->ice_arq_max - fast_retries);
     ret = 0;
@@ -1809,6 +1863,10 @@ static int setup_srtp(AVFormatContext *s)
     char buf[AV_BASE64_SIZE(DTLS_SRTP_MASTER_KEY_LEN)];
     const char* suite = "AES_CM_128_HMAC_SHA1_80";
     RTCContext *rtc = s->priv_data;
+
+    /* TODO: FIXME: Do it in DTLS callback. */
+    if (rtc->state < RTC_STATE_DTLS_FINISHED)
+        rtc->state = RTC_STATE_DTLS_FINISHED;
 
     /* As DTLS client, the send key is client master key plus salt. */
     memcpy(send_key, rtc->dtls_ctx.dtls_srtp_material, 16);
@@ -1856,7 +1914,9 @@ static int setup_srtp(AVFormatContext *s)
         goto end;
     }
 
-    av_log(s, AV_LOG_INFO, "WHIP: SRTP setup done, suite=%s, key=%luB\n", suite, sizeof(send_key));
+    if (rtc->state < RTC_STATE_SRTP_FINISHED)
+        rtc->state = RTC_STATE_SRTP_FINISHED;
+    av_log(s, AV_LOG_INFO, "WHIP: SRTP setup done, state=%d, suite=%s, key=%luB\n", rtc->state, suite, sizeof(send_key));
 
 end:
     return ret;
@@ -1953,8 +2013,10 @@ static int create_rtp_muxer(AVFormatContext *s)
         rtp_ctx = NULL;
     }
 
-    av_log(s, AV_LOG_INFO, "WHIP: Create RTP muxer OK, buffer_size=%d, max_packet_size=%d\n",
-        buffer_size, max_packet_size);
+    if (rtc->state < RTC_STATE_READY)
+        rtc->state = RTC_STATE_READY;
+    av_log(s, AV_LOG_INFO, "WHIP: Create RTP muxer OK, state=%d, buffer_size=%d, max_packet_size=%d\n",
+        rtc->state, buffer_size, max_packet_size);
 
 end:
     if (rtp_ctx)
@@ -2152,38 +2214,41 @@ static av_cold int rtc_init(AVFormatContext *s)
     RTCContext *rtc = s->priv_data;
 
     if ((ret = whip_init(s)) < 0)
-        return ret;
+        goto end;
 
     if ((ret = parse_codec(s)) < 0)
-        return ret;
+        goto end;
 
     if ((ret = generate_sdp_offer(s)) < 0)
-        return ret;
+        goto end;
 
     if ((ret = exchange_sdp(s)) < 0)
-        return ret;
+        goto end;
 
     if ((ret = parse_answer(s)) < 0)
-        return ret;
+        goto end;
 
     if ((ret = udp_connect(s)) < 0)
-        return ret;
+        goto end;
 
     if ((ret = ice_handshake(s)) < 0)
-        return ret;
+        goto end;
 
     if ((ret = dtls_context_start_handshake(&rtc->dtls_ctx)) < 0)
-        return ret;
+        goto end;
 
     if ((ret = dtls_context_do_handshake(&rtc->dtls_ctx)) < 0)
-        return ret;
+        goto end;
 
     if ((ret = setup_srtp(s)) < 0)
-        return ret;
+        goto end;
 
     if ((ret = create_rtp_muxer(s)) < 0)
-        return ret;
+        goto end;
 
+end:
+    if (ret < 0 && rtc->state < RTC_STATE_FAILED)
+        rtc->state = RTC_STATE_FAILED;
     return ret;
 }
 
@@ -2212,7 +2277,7 @@ static int rtc_write_packet(AVFormatContext *s, AVPacket *pkt)
     ret = insert_sps_pps_packet(s, pkt);
     if (ret < 0) {
         av_log(s, AV_LOG_ERROR, "Failed to insert SPS/PPS packet\n");
-        return ret;
+        goto end;
     }
 
     ret = ff_write_chained(rtp_ctx, 0, pkt, s, 0);
@@ -2222,9 +2287,12 @@ static int rtc_write_packet(AVFormatContext *s, AVPacket *pkt)
             ret = 0;
         } else
             av_log(s, AV_LOG_ERROR, "Failed to write packet, size=%d\n", pkt->size);
-        return ret;
+        goto end;
     }
 
+end:
+    if (ret < 0 && rtc->state < RTC_STATE_FAILED)
+        rtc->state = RTC_STATE_FAILED;
     return ret;
 }
 
