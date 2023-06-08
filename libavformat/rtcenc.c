@@ -182,6 +182,25 @@ static int is_dtls_packet(char *buf, int buf_size) {
 }
 
 /**
+ * Retrieves the error message for the latest OpenSSL error.
+ *
+ * This function retrieves the error code from the thread's error queue, converts it
+ * to a human-readable string, and stores it in the DTLSContext's error_message field.
+ * The error queue is then cleared using ERR_clear_error().
+ */
+static const char* openssl_get_error(DTLSContext *ctx)
+{
+    int r2 = ERR_get_error();
+    if (r2)
+        ERR_error_string_n(r2, ctx->error_message, sizeof(ctx->error_message));
+    else
+        ctx->error_message[0] = '\0';
+
+    ERR_clear_error();
+    return ctx->error_message;
+}
+
+/**
  * Get the error code for the given SSL operation result.
  *
  * This function retrieves the error code for the given SSL operation result
@@ -191,13 +210,12 @@ static int is_dtls_packet(char *buf, int buf_size) {
 static int openssl_ssl_get_error(DTLSContext *ctx, int ret)
 {
     SSL *dtls = ctx->dtls;
-    int r1 = SSL_get_error(dtls, ret);
-    int r2 = ERR_get_error();
-    if (r2)
-        ERR_error_string_n(r2, ctx->error_message, sizeof(ctx->error_message));
-    else
-        ctx->error_message[0] = '\0';
-    ERR_clear_error();
+    int r1 = SSL_ERROR_NONE;
+
+    if (ret <= 0)
+        r1 = SSL_get_error(dtls, ret);
+
+    openssl_get_error(ctx);
     return r1;
 }
 
@@ -338,23 +356,31 @@ static long openssl_dtls_bio_out_callback_ex(BIO *b, int oper, const char *argp,
 static int openssl_dtls_gen_private_key(DTLSContext *ctx)
 {
     int ret = 0;
-#if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
-    EC_GROUP *ecgroup = NULL;
-#else
-    const char *curve = "prime256v1";
-#endif
 
-    /* Should use the curves in ClientHello.supported_groups, for example:
+    /**
+     * Note that secp256r1 in openssl is called NID_X9_62_prime256v1 or prime256v1 in string,
+     * not NID_secp256k1 or secp256k1 in string.
+     *
+     * TODO: Should choose the curves in ClientHello.supported_groups, for example:
      *      Supported Group: x25519 (0x001d)
      *      Supported Group: secp256r1 (0x0017)
      *      Supported Group: secp384r1 (0x0018)
-     * Note that secp256r1 in openssl is called NID_X9_62_prime256v1 or prime256v1 in string,
-     * not NID_secp256k1 or secp256k1 in string
      */
+#if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
+    EC_GROUP *ecgroup = NULL;
+    int curve = NID_X9_62_prime256v1;
+#else
+    const char *curve = SN_X9_62_prime256v1;
+#endif
+
 #if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
     ctx->dtls_pkey = EVP_PKEY_new();
     ctx->dtls_eckey = EC_KEY_new();
-    ecgroup = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
+    ecgroup = EC_GROUP_new_by_curve_name(curve);
+    if (!ecgroup) {
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Create EC group by curve=%d failed, %s", curve, openssl_get_error(ctx));
+        goto einval_end;
+    }
 
 #if OPENSSL_VERSION_NUMBER < 0x10100000L // v1.1.x
     /* For openssl 1.0, we must set the group parameters, so that cert is ok. */
@@ -362,31 +388,30 @@ static int openssl_dtls_gen_private_key(DTLSContext *ctx)
 #endif
 
     if (EC_KEY_set_group(ctx->dtls_eckey, ecgroup) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: Unable to generate private key, EC_KEY_set_group failure\n");
-        ret = AVERROR(EINVAL);
-        goto end;
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Generate private key, EC_KEY_set_group failed, %s\n", openssl_get_error(ctx));
+        goto einval_end;
     }
 
     if (EC_KEY_generate_key(ctx->dtls_eckey) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: EC_KEY_generate_key failed\n");
-        ret = AVERROR(EINVAL);
-        goto end;
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Generate private key, EC_KEY_generate_key failed, %s\n", openssl_get_error(ctx));
+        goto einval_end;
     }
 
     if (EVP_PKEY_set1_EC_KEY(ctx->dtls_pkey, ctx->dtls_eckey) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: EVP_PKEY_set1_EC_KEY failed\n");
-        ret = AVERROR(EINVAL);
-        goto end;
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Generate private key, EVP_PKEY_set1_EC_KEY failed, %s\n", openssl_get_error(ctx));
+        goto einval_end;
     }
 #else
     ctx->dtls_pkey = EVP_EC_gen(curve);
     if (!ctx->dtls_pkey) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: EVP_EC_gen curve=%s failed\n", curve);
-        ret = AVERROR(EINVAL);
-        goto end;
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Generate private key, EVP_EC_gen curve=%s failed, %s\n", curve, openssl_get_error(ctx));
+        goto einval_end;
     }
 #endif
+    goto end;
 
+einval_end:
+    ret = AVERROR(EINVAL);
 end:
 #if OPENSSL_VERSION_NUMBER < 0x30000000L /* OpenSSL 3.0 */
     EC_GROUP_free(ecgroup);
@@ -408,99 +433,89 @@ static int openssl_dtls_gen_certificate(DTLSContext *ctx)
 
     dtls_cert = ctx->dtls_cert = X509_new();
     if (!dtls_cert) {
-        ret = AVERROR(ENOMEM);
-        goto end;
+        goto enomem_end;
     }
 
     // TODO: Support non-self-signed certificate, for example, load from a file.
     subject = X509_NAME_new();
     if (!subject) {
-        ret = AVERROR(ENOMEM);
-        goto end;
+        goto enomem_end;
     }
 
     serial = (int)av_get_random_seed();
     if (ASN1_INTEGER_set(X509_get_serialNumber(dtls_cert), serial) != 1) {
         av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set serial\n");
-        ret = AVERROR(EINVAL);
-        goto end;
+        goto einval_end;
     }
 
     if (X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC, aor, strlen(aor), -1, 0) != 1) {
         av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set CN\n");
-        ret = AVERROR(EINVAL);
-        goto end;
+        goto einval_end;
     }
 
     if (X509_set_issuer_name(dtls_cert, subject) != 1) {
         av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set issuer\n");
-        ret = AVERROR(EINVAL);
-        goto end;
+        goto einval_end;
     }
     if (X509_set_subject_name(dtls_cert, subject) != 1) {
         av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set subject name\n");
-        ret = AVERROR(EINVAL);
-        goto end;
+        goto einval_end;
     }
 
     expire_day = 365;
     if (!X509_gmtime_adj(X509_get_notBefore(dtls_cert), 0)) {
         av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set notBefore\n");
-        ret = AVERROR(EINVAL);
-        goto end;
+        goto einval_end;
     }
     if (!X509_gmtime_adj(X509_get_notAfter(dtls_cert), 60*60*24*expire_day)) {
         av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set notAfter\n");
-        ret = AVERROR(EINVAL);
-        goto end;
+        goto einval_end;
     }
 
     if (X509_set_version(dtls_cert, 2) != 1) {
         av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set version\n");
-        ret = AVERROR(EINVAL);
-        goto end;
+        goto einval_end;
     }
 
     if (X509_set_pubkey(dtls_cert, ctx->dtls_pkey) != 1) {
         av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set public key\n");
-        ret = AVERROR(EINVAL);
-        goto end;
+        goto einval_end;
     }
 
     if (!X509_sign(dtls_cert, ctx->dtls_pkey, EVP_sha1())) {
         av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to sign certificate\n");
-        ret = AVERROR(EINVAL);
-        goto end;
+        goto einval_end;
     }
 
     /* Generate the fingerpint of certficate. */
     if (X509_digest(dtls_cert, EVP_sha256(), md, &n) != 1) {
         av_log(ctx, AV_LOG_ERROR, "Failed to generate fingerprint\n");
-        ret = AVERROR(EIO);
-        goto end;
+        goto eio_end;
     }
     for (i = 0; i < n; i++) {
         av_bprintf(&fingerprint, "%02X", md[i]);
         if (i < n - 1)
             av_bprintf(&fingerprint, ":");
     }
-    if (!av_bprint_is_complete(&fingerprint)) {
-        av_log(ctx, AV_LOG_ERROR, "Fingerprint %d exceed max %d, %s\n", ret, MAX_URL_SIZE, fingerprint.str);
-        ret = AVERROR(EIO);
-        goto end;
-    }
     if (!fingerprint.str || !strlen(fingerprint.str)) {
         av_log(ctx, AV_LOG_ERROR, "Fingerprint is empty\n");
-        ret = AVERROR(EINVAL);
-        goto end;
+        goto einval_end;
     }
 
     ctx->dtls_fingerprint = av_strdup(fingerprint.str);
     if (!ctx->dtls_fingerprint) {
-        ret = AVERROR(ENOMEM);
-        goto end;
+        goto enomem_end;
     }
 
+    goto end;
+enomem_end:
+    ret = AVERROR(ENOMEM);
+    goto end;
+eio_end:
+    ret = AVERROR(EIO);
+    goto end;
+einval_end:
+    ret = AVERROR(EINVAL);
 end:
     X509_NAME_free(subject);
     av_bprint_finalize(&fingerprint, NULL);
@@ -1239,11 +1254,6 @@ static int generate_sdp_offer(AVFormatContext *s)
         "a=group:BUNDLE 0 1\r\n"
         "a=extmap-allow-mixed\r\n"
         "a=msid-semantic: WMS\r\n");
-    if (!av_bprint_is_complete(&bp)) {
-        av_log(rtc, AV_LOG_ERROR, "Offer %d exceed max %d, %s\n", ret, MAX_SDP_SIZE, bp.str);
-        ret = AVERROR(EIO);
-        goto end;
-    }
 
     if (rtc->audio_par) {
         av_bprintf(&bp, ""
@@ -1269,11 +1279,6 @@ static int generate_sdp_offer(AVFormatContext *s)
             rtc->audio_par->ch_layout.nb_channels,
             rtc->audio_ssrc,
             rtc->audio_ssrc);
-        if (!av_bprint_is_complete(&bp)) {
-            av_log(rtc, AV_LOG_ERROR, "Offer %d exceed max %d, %s\n", ret, MAX_SDP_SIZE, bp.str);
-            ret = AVERROR(EIO);
-            goto end;
-        }
     }
 
     if (rtc->video_par) {
@@ -1307,11 +1312,12 @@ static int generate_sdp_offer(AVFormatContext *s)
             level,
             rtc->video_ssrc,
             rtc->video_ssrc);
-        if (!av_bprint_is_complete(&bp)) {
-            av_log(rtc, AV_LOG_ERROR, "Offer %d exceed max %d, %s\n", ret, MAX_SDP_SIZE, bp.str);
-            ret = AVERROR(EIO);
-            goto end;
-        }
+    }
+
+    if (!av_bprint_is_complete(&bp)) {
+        av_log(rtc, AV_LOG_ERROR, "Offer exceed max %d, %s\n", MAX_SDP_SIZE, bp.str);
+        ret = AVERROR(EIO);
+        goto end;
     }
 
     rtc->sdp_offer = av_strdup(bp.str);
@@ -1403,7 +1409,7 @@ static int exchange_sdp(AVFormatContext *s)
 
         av_bprintf(&bp, "%.*s", ret, buf);
         if (!av_bprint_is_complete(&bp)) {
-            av_log(rtc, AV_LOG_ERROR, "Answer %d exceed max size %d, %s\n", ret, MAX_SDP_SIZE, bp.str);
+            av_log(rtc, AV_LOG_ERROR, "Answer exceed max size %d, %.*s, %s\n", MAX_SDP_SIZE, ret, buf, bp.str);
             ret = AVERROR(EIO);
             goto end;
         }
