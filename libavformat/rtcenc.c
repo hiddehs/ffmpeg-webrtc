@@ -949,11 +949,11 @@ typedef struct RTCContext {
     DTLSContext dtls_ctx;
 
     /* The SRTP send context, to encrypt outgoing packets. */
-    struct SRTPContext srtp_audio_send;
-    struct SRTPContext srtp_video_send;
-    struct SRTPContext srtp_rtcp_send;
+    SRTPContext srtp_audio_send;
+    SRTPContext srtp_video_send;
+    SRTPContext srtp_rtcp_send;
     /* The SRTP receive context, to decrypt incoming packets. */
-    struct SRTPContext srtp_recv;
+    SRTPContext srtp_recv;
 
     /* The time jitter base for audio OPUS stream. */
     int64_t audio_jitter_base;
@@ -2153,7 +2153,7 @@ static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size)
     uint8_t payload_type, nalu_header;
     AVFormatContext *s = opaque;
     RTCContext *rtc = s->priv_data;
-    struct SRTPContext *srtp;
+    SRTPContext *srtp;
 
     /* Ignore if not RTP or RTCP packet. */
     if (buf_size < 12 || (buf[0] & 0xC0) != 0x80)
