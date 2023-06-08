@@ -2465,7 +2465,7 @@ static int rtc_write_packet(AVFormatContext *s, AVPacket *pkt)
 
     ret = insert_sps_pps_packet(s, pkt);
     if (ret < 0) {
-        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to insert SPS/PPS packet\n");
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to insert codec metadata packet\n");
         goto end;
     }
 
