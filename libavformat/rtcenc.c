@@ -294,7 +294,7 @@ static void openssl_dtls_state_trace(DTLSContext *ctx, uint8_t *data, int length
     if (length >= 14)
         handshake_type = (uint8_t)data[13];
 
-    av_log(ctx, AV_LOG_VERBOSE, "WHIP: DTLS %s, done=%u, arq=%u, len=%u, cnt=%u, size=%u, hs=%u\n",
+    av_log(ctx, AV_LOG_VERBOSE, "DTLS: Trace %s, done=%u, arq=%u, len=%u, cnt=%u, size=%u, hs=%u\n",
         (incoming? "RECV":"SEND"), ctx->dtls_done_for_us, ctx->dtls_arq_packets, length,
         content_type, size, handshake_type);
 }
@@ -444,52 +444,52 @@ static int openssl_dtls_gen_certificate(DTLSContext *ctx)
 
     serial = (int)av_get_random_seed();
     if (ASN1_INTEGER_set(X509_get_serialNumber(dtls_cert), serial) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set serial\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to set serial, %s\n", openssl_get_error(ctx));
         goto einval_end;
     }
 
     if (X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC, aor, strlen(aor), -1, 0) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set CN\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to set CN, %s\n", openssl_get_error(ctx));
         goto einval_end;
     }
 
     if (X509_set_issuer_name(dtls_cert, subject) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set issuer\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to set issuer, %s\n", openssl_get_error(ctx));
         goto einval_end;
     }
     if (X509_set_subject_name(dtls_cert, subject) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set subject name\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to set subject name, %s\n", openssl_get_error(ctx));
         goto einval_end;
     }
 
     expire_day = 365;
     if (!X509_gmtime_adj(X509_get_notBefore(dtls_cert), 0)) {
-        av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set notBefore\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to set notBefore, %s\n", openssl_get_error(ctx));
         goto einval_end;
     }
     if (!X509_gmtime_adj(X509_get_notAfter(dtls_cert), 60*60*24*expire_day)) {
-        av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set notAfter\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to set notAfter, %s\n", openssl_get_error(ctx));
         goto einval_end;
     }
 
     if (X509_set_version(dtls_cert, 2) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set version\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to set version, %s\n", openssl_get_error(ctx));
         goto einval_end;
     }
 
     if (X509_set_pubkey(dtls_cert, ctx->dtls_pkey) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set public key\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to set public key, %s\n", openssl_get_error(ctx));
         goto einval_end;
     }
 
     if (!X509_sign(dtls_cert, ctx->dtls_pkey, EVP_sha1())) {
-        av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to sign certificate\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to sign certificate, %s\n", openssl_get_error(ctx));
         goto einval_end;
     }
 
     /* Generate the fingerpint of certficate. */
     if (X509_digest(dtls_cert, EVP_sha256(), md, &n) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "Failed to generate fingerprint\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to generate fingerprint, %s\n", openssl_get_error(ctx));
         goto eio_end;
     }
     for (i = 0; i < n; i++) {
@@ -498,7 +498,7 @@ static int openssl_dtls_gen_certificate(DTLSContext *ctx)
             av_bprintf(&fingerprint, ":");
     }
     if (!fingerprint.str || !strlen(fingerprint.str)) {
-        av_log(ctx, AV_LOG_ERROR, "Fingerprint is empty\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Fingerprint is empty\n");
         goto einval_end;
     }
 
@@ -533,6 +533,11 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
     SSL_CTX *dtls_ctx = NULL;
     SSL *dtls = NULL;
     BIO *bio_in = NULL, *bio_out = NULL;
+    const char* ciphers = "ALL";
+    const char* profiles = "SRTP_AES128_CM_SHA1_80";
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L /* OpenSSL 1.0.2 */
+    const char* curves = "P-521:P-384:P-256";
+#endif
 
 #if OPENSSL_VERSION_NUMBER < 0x10002000L /* OpenSSL v1.0.2 */
     dtls_ctx = ctx->dtls_ctx = SSL_CTX_new(DTLSv1_method());
@@ -545,8 +550,9 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
 
 #if OPENSSL_VERSION_NUMBER >= 0x10002000L /* OpenSSL 1.0.2 */
     /* For ECDSA, we could set the curves list. */
-    if (SSL_CTX_set1_curves_list(dtls_ctx, "P-521:P-384:P-256") != 1) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: SSL_CTX_set1_curves_list failed\n");
+    if (SSL_CTX_set1_curves_list(dtls_ctx, curves) != 1) {
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Init SSL_CTX_set1_curves_list failed, curves=%s, %s\n",
+            curves, openssl_get_error(ctx));
         return AVERROR(EINVAL);
     }
 #endif
@@ -563,17 +569,18 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
      * We activate "ALL" cipher suites to align with the peer's capabilities,
      * ensuring maximum compatibility.
      */
-    if (SSL_CTX_set_cipher_list(dtls_ctx, "ALL") != 1) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: SSL_CTX_set_cipher_list failed\n");
+    if (SSL_CTX_set_cipher_list(dtls_ctx, ciphers) != 1) {
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Init SSL_CTX_set_cipher_list failed, ciphers=%s, %s\n",
+            ciphers, openssl_get_error(ctx));
         return AVERROR(EINVAL);
     }
     /* Setup the certificate. */
     if (SSL_CTX_use_certificate(dtls_ctx, dtls_cert) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: SSL_CTX_use_certificate failed\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Init SSL_CTX_use_certificate failed, %s\n", openssl_get_error(ctx));
         return AVERROR(EINVAL);
     }
     if (SSL_CTX_use_PrivateKey(dtls_ctx, dtls_pkey) != 1) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: SSL_CTX_use_PrivateKey failed\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Init SSL_CTX_use_PrivateKey failed, %s\n", openssl_get_error(ctx));
         return AVERROR(EINVAL);
     }
 
@@ -585,8 +592,9 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
     /* Whether we should read as many input bytes as possible (for non-blocking reads) or not. */
     SSL_CTX_set_read_ahead(dtls_ctx, 1);
     /* Only support SRTP_AES128_CM_SHA1_80, please read ssl/d1_srtp.c */
-    if (SSL_CTX_set_tlsext_use_srtp(dtls_ctx, "SRTP_AES128_CM_SHA1_80")) {
-        av_log(ctx, AV_LOG_ERROR, "DTLS: SSL_CTX_set_tlsext_use_srtp failed\n");
+    if (SSL_CTX_set_tlsext_use_srtp(dtls_ctx, profiles)) {
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Init SSL_CTX_set_tlsext_use_srtp failed, profiles=%s, %s\n",
+            profiles, openssl_get_error(ctx));
         return AVERROR(EINVAL);
     }
 
@@ -659,18 +667,18 @@ static av_cold int dtls_context_init(DTLSContext *ctx)
 
     /* Generate a private key to ctx->dtls_pkey. */
     if ((ret = openssl_dtls_gen_private_key(ctx)) < 0) {
-        av_log(ctx, AV_LOG_ERROR, "Failed to generate DTLS private key\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to generate DTLS private key\n");
         return ret;
     }
 
     /* Generate a self-signed certificate. */
     if ((ret = openssl_dtls_gen_certificate(ctx)) < 0) {
-        av_log(ctx, AV_LOG_ERROR, "Failed to generate DTLS certificate\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to generate DTLS certificate\n");
         return ret;
     }
 
     if ((ret = openssl_dtls_init_context(ctx)) < 0) {
-        av_log(ctx, AV_LOG_ERROR, "Failed to initialize DTLS context\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to initialize DTLS context\n");
         return ret;
     }
 
@@ -708,7 +716,7 @@ static int dtls_context_start(DTLSContext *ctx)
     r1 = openssl_ssl_get_error(ctx, r0);
     // Fatal SSL error, for example, no available suite when peer is DTLS 1.0 while we are DTLS 1.2.
     if (r0 < 0 && (r1 != SSL_ERROR_NONE && r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE)) {
-        av_log(ctx, AV_LOG_ERROR, "Failed to drive SSL context, r0=%d, r1=%d %s\n", r0, r1, ctx->error_message);
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Failed to drive SSL context, r0=%d, r1=%d %s\n", r0, r1, ctx->error_message);
         return AVERROR(EIO);
     }
 
