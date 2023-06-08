@@ -535,6 +535,10 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
     SSL *dtls = NULL;
     BIO *bio_in = NULL, *bio_out = NULL;
     const char* ciphers = "ALL";
+    /**
+     * The profile for OpenSSL's SRTP is SRTP_AES128_CM_SHA1_80, see ssl/d1_srtp.c.
+     * The profile for FFmpeg's SRTP is SRTP_AES128_CM_HMAC_SHA1_80, see libavformat/srtp.c.
+     */
     const char* profiles = "SRTP_AES128_CM_SHA1_80";
 
     /* Refer to the test cases regarding these curves in the WebRTC code. */
@@ -596,7 +600,7 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
     SSL_CTX_set_verify_depth(dtls_ctx, 4);
     /* Whether we should read as many input bytes as possible (for non-blocking reads) or not. */
     SSL_CTX_set_read_ahead(dtls_ctx, 1);
-    /* Only support SRTP_AES128_CM_SHA1_80, please read ssl/d1_srtp.c */
+    /* Setup the SRTP context */
     if (SSL_CTX_set_tlsext_use_srtp(dtls_ctx, profiles)) {
         av_log(ctx, AV_LOG_ERROR, "DTLS: Init SSL_CTX_set_tlsext_use_srtp failed, profiles=%s, %s\n",
             profiles, openssl_get_error(ctx));
@@ -1915,7 +1919,11 @@ static int setup_srtp(AVFormatContext *s)
     char recv_key[DTLS_SRTP_KEY_LEN + DTLS_SRTP_SALT_LEN];
     char send_key[DTLS_SRTP_KEY_LEN + DTLS_SRTP_SALT_LEN];
     char buf[AV_BASE64_SIZE(DTLS_SRTP_KEY_LEN + DTLS_SRTP_SALT_LEN)];
-    const char* suite = "AES_CM_128_HMAC_SHA1_80";
+    /**
+     * The profile for OpenSSL's SRTP is SRTP_AES128_CM_SHA1_80, see ssl/d1_srtp.c.
+     * The profile for FFmpeg's SRTP is SRTP_AES128_CM_HMAC_SHA1_80, see libavformat/srtp.c.
+     */
+    const char* suite = "SRTP_AES128_CM_HMAC_SHA1_80";
     RTCContext *rtc = s->priv_data;
 
     /**
