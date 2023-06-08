@@ -114,10 +114,15 @@ typedef int (*DTLSContext_on_state_fn)(DTLSContext *ctx, enum DTLSState state, c
 typedef int (*DTLSContext_on_write_fn)(DTLSContext *ctx, char* data, int size);
 
 typedef struct DTLSContext {
+    AVClass *av_class;
+
     /* For callback. */
     DTLSContext_on_state_fn on_state;
     DTLSContext_on_write_fn on_write;
     void* opaque;
+
+    /* For logging. */
+    AVClass *log_avcl;
 
     /* The DTLS context. */
     SSL_CTX *dtls_ctx;
@@ -161,6 +166,10 @@ typedef struct DTLSContext {
     int64_t dtls_handshake_starttime;
     int64_t dtls_handshake_endtime;
 
+    /* Helper for get error code and message. */
+    int error_code;
+    char error_message[256];
+
     /**
      * The size of RTP packet, should generally be set to MTU.
      * Note that pion requires a smaller value, for example, 1200.
@@ -170,6 +179,26 @@ typedef struct DTLSContext {
 
 static int is_dtls_packet(char *buf, int buf_size) {
     return buf_size > 13 && buf[0] > 19 && buf[0] < 64;
+}
+
+/**
+ * Get the error code for the given SSL operation result.
+ *
+ * This function retrieves the error code for the given SSL operation result
+ * and stores the error message in the DTLS context if an error occurred.
+ * It also clears the error queue.
+ */
+static int openssl_ssl_get_error(DTLSContext *ctx, int ret)
+{
+    SSL *dtls = ctx->dtls;
+    int r1 = SSL_get_error(dtls, ret);
+    int r2 = ERR_get_error();
+    if (r2)
+        ERR_error_string_n(r2, ctx->error_message, sizeof(ctx->error_message));
+    else
+        ctx->error_message[0] = '\0';
+    ERR_clear_error();
+    return r1;
 }
 
 /**
@@ -188,9 +217,9 @@ static void openssl_dtls_on_info(const SSL *dtls, int where, int r0)
     else if (w & SSL_ST_ACCEPT)
         method = "SSL_accept";
 
-    r1 = SSL_get_error(dtls, r0);
+    r1 = openssl_ssl_get_error(ctx, r0);
     if (where & SSL_CB_LOOP) {
-        av_log(NULL, AV_LOG_VERBOSE, "DTLS: method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
+        av_log(ctx, AV_LOG_VERBOSE, "DTLS: Info method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
             method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, r0, r1);
     } else if (where & SSL_CB_ALERT) {
         method = (where & SSL_CB_READ) ? "read":"write";
@@ -199,11 +228,11 @@ static void openssl_dtls_on_info(const SSL *dtls, int where, int r0)
         alert_desc = SSL_alert_desc_string(r0);
 
         if (!av_strcasecmp(alert_type, "warning") && !av_strcasecmp(alert_desc, "CN"))
-            av_log(NULL, AV_LOG_WARNING, "DTLS: SSL3 alert method=%s type=%s, desc=%s(%s), where=%d, ret=%d, r1=%d\n",
+            av_log(ctx, AV_LOG_WARNING, "DTLS: SSL3 alert method=%s type=%s, desc=%s(%s), where=%d, ret=%d, r1=%d\n",
                 method, alert_type, alert_desc, SSL_alert_desc_string_long(r0), where, r0, r1);
         else
-            av_log(NULL, AV_LOG_ERROR, "DTLS: SSL3 alert method=%s type=%s, desc=%s(%s), where=%d, ret=%d, r1=%d\n",
-                method, alert_type, alert_desc, SSL_alert_desc_string_long(r0), where, r0, r1);
+            av_log(ctx, AV_LOG_ERROR, "DTLS: SSL3 alert method=%s type=%s, desc=%s(%s), where=%d, ret=%d, r1=%d %s\n",
+                method, alert_type, alert_desc, SSL_alert_desc_string_long(r0), where, r0, r1, ctx->error_message);
 
         /**
          * Notify the DTLS to handle the ALERT message, which maybe means media connection disconnect.
@@ -215,20 +244,20 @@ static void openssl_dtls_on_info(const SSL *dtls, int where, int r0)
         is_close_notify = !av_strncasecmp(alert_desc, "CN", 2);
         state = is_fatal ? DTLS_STATE_FAILED : (is_warning && is_close_notify ? DTLS_STATE_CLOSED : DTLS_STATE_NONE);
         if (state != DTLS_STATE_NONE && ctx->on_state) {
-            av_log(NULL, AV_LOG_INFO, "DTLS: Notify ctx=%p, state=%d, fatal=%d, warning=%d, cn=%d\n",
+            av_log(ctx, AV_LOG_INFO, "DTLS: Notify ctx=%p, state=%d, fatal=%d, warning=%d, cn=%d\n",
                 ctx, state, is_fatal, is_warning, is_close_notify);
             ctx->on_state(ctx, state, alert_type, alert_desc);
         }
     } else if (where & SSL_CB_EXIT) {
         if (!r0)
-            av_log(NULL, AV_LOG_WARNING, "DTLS: Fail method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
+            av_log(ctx, AV_LOG_WARNING, "DTLS: Fail method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
                 method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, r0, r1);
         else if (r0 < 0)
             if (r1 != SSL_ERROR_NONE && r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE)
-                av_log(NULL, AV_LOG_ERROR, "DTLS: Error method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
-                    method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, r0, r1);
+                av_log(ctx, AV_LOG_ERROR, "DTLS: Error method=%s state=%s(%s), where=%d, ret=%d, r1=%d %s\n",
+                    method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, r0, r1, ctx->error_message);
             else
-                av_log(NULL, AV_LOG_VERBOSE, "DTLS: method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
+                av_log(ctx, AV_LOG_VERBOSE, "DTLS: Info method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
                     method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, r0, r1);
     }
 }
@@ -247,8 +276,8 @@ static void openssl_dtls_state_trace(DTLSContext *ctx, uint8_t *data, int length
     if (length >= 14)
         handshake_type = (uint8_t)data[13];
 
-    av_log(NULL, AV_LOG_VERBOSE, "WHIP: DTLS state %s %s, done=%u, arq=%u, len=%u, cnt=%u, size=%u, hs=%u\n",
-        "Active", (incoming? "RECV":"SEND"), ctx->dtls_done_for_us, ctx->dtls_arq_packets, length,
+    av_log(ctx, AV_LOG_VERBOSE, "WHIP: DTLS %s, done=%u, arq=%u, len=%u, cnt=%u, size=%u, hs=%u\n",
+        (incoming? "RECV":"SEND"), ctx->dtls_done_for_us, ctx->dtls_arq_packets, length,
         content_type, size, handshake_type);
 }
 
@@ -277,10 +306,10 @@ static long openssl_dtls_bio_out_callback_ex(BIO *b, int oper, const char *argp,
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L // v3.0.x
     req_size = len;
-    av_log(NULL, AV_LOG_DEBUG, "DTLS: bio callback b=%p, oper=%d, argp=%p, len=%ld, argi=%d, argl=%ld, retvalue=%d, processed=%p, req_size=%d\n",
+    av_log(ctx, AV_LOG_DEBUG, "DTLS: BIO callback b=%p, oper=%d, argp=%p, len=%ld, argi=%d, argl=%ld, retvalue=%d, processed=%p, req_size=%d\n",
         b, oper, argp, len, argi, argl, retvalue, processed, req_size);
 #else
-    av_log(NULL, AV_LOG_DEBUG, "DTLS: bio callback b=%p, oper=%d, argp=%p, argi=%d, argl=%ld, retvalue=%ld, req_size=%d\n",
+    av_log(ctx, AV_LOG_DEBUG, "DTLS: BIO callback b=%p, oper=%d, argp=%p, argi=%d, argl=%ld, retvalue=%ld, req_size=%d\n",
         b, oper, argp, argi, argl, retvalue, req_size);
 #endif
 
@@ -298,7 +327,7 @@ static long openssl_dtls_bio_out_callback_ex(BIO *b, int oper, const char *argp,
     ctx->dtls_last_handshake_type = handshake_type;
 
     if (ret < 0) {
-        av_log(NULL, AV_LOG_ERROR, "DTLS: Send request failed, oper=%d, content=%d, handshake=%d, size=%d, is_arq=%d\n",
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Send request failed, oper=%d, content=%d, handshake=%d, size=%d, is_arq=%d\n",
             oper, content_type, handshake_type, req_size, is_arq);
         return ret;
     }
@@ -333,26 +362,26 @@ static int openssl_dtls_gen_private_key(DTLSContext *ctx)
 #endif
 
     if (EC_KEY_set_group(ctx->dtls_eckey, ecgroup) != 1) {
-        av_log(NULL, AV_LOG_ERROR, "DTLS: EC_KEY_set_group failed\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Unable to generate private key, EC_KEY_set_group failure\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     if (EC_KEY_generate_key(ctx->dtls_eckey) != 1) {
-        av_log(NULL, AV_LOG_ERROR, "DTLS: EC_KEY_generate_key failed\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: EC_KEY_generate_key failed\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     if (EVP_PKEY_set1_EC_KEY(ctx->dtls_pkey, ctx->dtls_eckey) != 1) {
-        av_log(NULL, AV_LOG_ERROR, "DTLS: EVP_PKEY_set1_EC_KEY failed\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: EVP_PKEY_set1_EC_KEY failed\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 #else
     ctx->dtls_pkey = EVP_EC_gen(curve);
     if (!ctx->dtls_pkey) {
-        av_log(NULL, AV_LOG_ERROR, "DTLS: EVP_EC_gen curve=%s failed\n", curve);
+        av_log(ctx, AV_LOG_ERROR, "DTLS: EVP_EC_gen curve=%s failed\n", curve);
         ret = AVERROR(EINVAL);
         goto end;
     }
@@ -383,6 +412,7 @@ static int openssl_dtls_gen_certificate(DTLSContext *ctx)
         goto end;
     }
 
+    // TODO: Support non-self-signed certificate, for example, load from a file.
     subject = X509_NAME_new();
     if (!subject) {
         ret = AVERROR(ENOMEM);
@@ -391,61 +421,61 @@ static int openssl_dtls_gen_certificate(DTLSContext *ctx)
 
     serial = (int)av_get_random_seed();
     if (ASN1_INTEGER_set(X509_get_serialNumber(dtls_cert), serial) != 1) {
-        av_log(NULL, AV_LOG_ERROR, "WHIP: Failed to set serial\n");
+        av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set serial\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     if (X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC, aor, strlen(aor), -1, 0) != 1) {
-        av_log(NULL, AV_LOG_ERROR, "WHIP: Failed to set CN\n");
+        av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set CN\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     if (X509_set_issuer_name(dtls_cert, subject) != 1) {
-        av_log(NULL, AV_LOG_ERROR, "WHIP: Failed to set issuer\n");
+        av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set issuer\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
     if (X509_set_subject_name(dtls_cert, subject) != 1) {
-        av_log(NULL, AV_LOG_ERROR, "WHIP: Failed to set subject name\n");
+        av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set subject name\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     expire_day = 365;
     if (!X509_gmtime_adj(X509_get_notBefore(dtls_cert), 0)) {
-        av_log(NULL, AV_LOG_ERROR, "WHIP: Failed to set notBefore\n");
+        av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set notBefore\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
     if (!X509_gmtime_adj(X509_get_notAfter(dtls_cert), 60*60*24*expire_day)) {
-        av_log(NULL, AV_LOG_ERROR, "WHIP: Failed to set notAfter\n");
+        av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set notAfter\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     if (X509_set_version(dtls_cert, 2) != 1) {
-        av_log(NULL, AV_LOG_ERROR, "WHIP: Failed to set version\n");
+        av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set version\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     if (X509_set_pubkey(dtls_cert, ctx->dtls_pkey) != 1) {
-        av_log(NULL, AV_LOG_ERROR, "WHIP: Failed to set public key\n");
+        av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to set public key\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     if (!X509_sign(dtls_cert, ctx->dtls_pkey, EVP_sha1())) {
-        av_log(NULL, AV_LOG_ERROR, "WHIP: Failed to sign certificate\n");
+        av_log(ctx, AV_LOG_ERROR, "WHIP: Failed to sign certificate\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     /* Generate the fingerpint of certficate. */
     if (X509_digest(dtls_cert, EVP_sha256(), md, &n) != 1) {
-        av_log(NULL, AV_LOG_ERROR, "Failed to generate fingerprint\n");
+        av_log(ctx, AV_LOG_ERROR, "Failed to generate fingerprint\n");
         ret = AVERROR(EIO);
         goto end;
     }
@@ -455,12 +485,12 @@ static int openssl_dtls_gen_certificate(DTLSContext *ctx)
             av_bprintf(&fingerprint, ":");
     }
     if (!av_bprint_is_complete(&fingerprint)) {
-        av_log(NULL, AV_LOG_ERROR, "Fingerprint %d exceed max %d, %s\n", ret, MAX_URL_SIZE, fingerprint.str);
+        av_log(ctx, AV_LOG_ERROR, "Fingerprint %d exceed max %d, %s\n", ret, MAX_URL_SIZE, fingerprint.str);
         ret = AVERROR(EIO);
         goto end;
     }
     if (!fingerprint.str || !strlen(fingerprint.str)) {
-        av_log(NULL, AV_LOG_ERROR, "Fingerprint is empty\n");
+        av_log(ctx, AV_LOG_ERROR, "Fingerprint is empty\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
@@ -501,7 +531,7 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
 #if OPENSSL_VERSION_NUMBER >= 0x10002000L /* OpenSSL 1.0.2 */
     /* For ECDSA, we could set the curves list. */
     if (SSL_CTX_set1_curves_list(dtls_ctx, "P-521:P-384:P-256") != 1) {
-        av_log(NULL, AV_LOG_ERROR, "DTLS: SSL_CTX_set1_curves_list failed\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: SSL_CTX_set1_curves_list failed\n");
         return AVERROR(EINVAL);
     }
 #endif
@@ -519,16 +549,16 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
      * ensuring maximum compatibility.
      */
     if (SSL_CTX_set_cipher_list(dtls_ctx, "ALL") != 1) {
-        av_log(NULL, AV_LOG_ERROR, "DTLS: SSL_CTX_set_cipher_list failed\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: SSL_CTX_set_cipher_list failed\n");
         return AVERROR(EINVAL);
     }
     /* Setup the certificate. */
     if (SSL_CTX_use_certificate(dtls_ctx, dtls_cert) != 1) {
-        av_log(NULL, AV_LOG_ERROR, "DTLS: SSL_CTX_use_certificate failed\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: SSL_CTX_use_certificate failed\n");
         return AVERROR(EINVAL);
     }
     if (SSL_CTX_use_PrivateKey(dtls_ctx, dtls_pkey) != 1) {
-        av_log(NULL, AV_LOG_ERROR, "DTLS: SSL_CTX_use_PrivateKey failed\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: SSL_CTX_use_PrivateKey failed\n");
         return AVERROR(EINVAL);
     }
 
@@ -541,7 +571,7 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
     SSL_CTX_set_read_ahead(dtls_ctx, 1);
     /* Only support SRTP_AES128_CM_SHA1_80, please read ssl/d1_srtp.c */
     if (SSL_CTX_set_tlsext_use_srtp(dtls_ctx, "SRTP_AES128_CM_SHA1_80")) {
-        av_log(NULL, AV_LOG_ERROR, "DTLS: SSL_CTX_set_tlsext_use_srtp failed\n");
+        av_log(ctx, AV_LOG_ERROR, "DTLS: SSL_CTX_set_tlsext_use_srtp failed\n");
         return AVERROR(EINVAL);
     }
 
@@ -614,23 +644,23 @@ static av_cold int dtls_context_init(DTLSContext *ctx)
 
     /* Generate a private key to ctx->dtls_pkey. */
     if ((ret = openssl_dtls_gen_private_key(ctx)) < 0) {
-        av_log(NULL, AV_LOG_ERROR, "Failed to generate DTLS private key\n");
+        av_log(ctx, AV_LOG_ERROR, "Failed to generate DTLS private key\n");
         return ret;
     }
 
     /* Generate a self-signed certificate. */
     if ((ret = openssl_dtls_gen_certificate(ctx)) < 0) {
-        av_log(NULL, AV_LOG_ERROR, "Failed to generate DTLS certificate\n");
+        av_log(ctx, AV_LOG_ERROR, "Failed to generate DTLS certificate\n");
         return ret;
     }
 
     if ((ret = openssl_dtls_init_context(ctx)) < 0) {
-        av_log(NULL, AV_LOG_ERROR, "Failed to initialize DTLS context\n");
+        av_log(ctx, AV_LOG_ERROR, "Failed to initialize DTLS context\n");
         return ret;
     }
 
     ctx->dtls_init_endtime = av_gettime();
-    av_log(NULL, AV_LOG_INFO, "DTLS: Setup ok, MTU=%d, cost=%dms, fingerprint %s\n",
+    av_log(ctx, AV_LOG_INFO, "DTLS: Setup ok, MTU=%d, cost=%dms, fingerprint %s\n",
         ctx->mtu, ELAPSED(ctx->dtls_init_starttime, av_gettime()), ctx->dtls_fingerprint);
 
     return ret;
@@ -644,7 +674,6 @@ static int dtls_context_start(DTLSContext *ctx)
 {
     int ret = 0, r0, r1;
     SSL *dtls = ctx->dtls;
-    char detail_error[256];
 
     ctx->dtls_handshake_starttime = av_gettime();
 
@@ -661,13 +690,10 @@ static int dtls_context_start(DTLSContext *ctx)
      * packets are received.
      */
     r0 = SSL_do_handshake(dtls);
-    r1 = SSL_get_error(dtls, r0);
-    if (r0 < 0 && r1 == SSL_ERROR_SSL)
-        ERR_error_string_n(ERR_get_error(), detail_error, sizeof(detail_error));
-    ERR_clear_error();
+    r1 = openssl_ssl_get_error(ctx, r0);
     // Fatal SSL error, for example, no available suite when peer is DTLS 1.0 while we are DTLS 1.2.
     if (r0 < 0 && (r1 != SSL_ERROR_NONE && r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE)) {
-        av_log(NULL, AV_LOG_ERROR, "Failed to drive SSL context, r0=%d, r1=%d %s\n", r0, r1, detail_error);
+        av_log(ctx, AV_LOG_ERROR, "Failed to drive SSL context, r0=%d, r1=%d %s\n", r0, r1, ctx->error_message);
         return AVERROR(EIO);
     }
 
@@ -689,14 +715,13 @@ static int dtls_context_write(DTLSContext *ctx, char* buf, int size)
     SSL *dtls = ctx->dtls;
     const char* dst = "EXTRACTOR-dtls_srtp";
     BIO *bio_in = ctx->bio_in;
-    char detail_error[256];
 
     /* Got DTLS response successfully. */
     openssl_dtls_state_trace(ctx, buf, size, 1);
     if ((r0 = BIO_write(bio_in, buf, size)) <= 0) {
         res_ct = size > 0 ? buf[0]: 0;
         res_ht = size > 13 ? buf[13] : 0;
-        av_log(NULL, AV_LOG_ERROR, "DTLS: Feed response failed, content=%d, handshake=%d, size=%d, r0=%d\n",
+        av_log(ctx, AV_LOG_ERROR, "DTLS: Feed response failed, content=%d, handshake=%d, size=%d, r0=%d\n",
             res_ct, res_ht, size, r0);
         ret = AVERROR(EIO);
         goto end;
@@ -707,18 +732,15 @@ static int dtls_context_write(DTLSContext *ctx, char* buf, int size)
      * We limit the MTU to 1200 for DTLS handshake, which ensures that the buffer is large enough for reading.
      */
     r0 = SSL_read(dtls, buf, sizeof(buf));
-    r1 = SSL_get_error(dtls, r0);
-    if (r0 < 0 && r1 == SSL_ERROR_SSL)
-        ERR_error_string_n(ERR_get_error(), detail_error, sizeof(detail_error));
-    ERR_clear_error();
+    r1 = openssl_ssl_get_error(ctx, r0);
     if (r0 <= 0) {
         if (r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE && r1 != SSL_ERROR_ZERO_RETURN) {
-            av_log(NULL, AV_LOG_ERROR, "DTLS: Read failed, r0=%d, r1=%d %s\n", r0, r1, detail_error);
+            av_log(ctx, AV_LOG_ERROR, "DTLS: Read failed, r0=%d, r1=%d %s\n", r0, r1, ctx->error_message);
             ret = AVERROR(EIO);
             goto end;
         }
     } else {
-        av_log(NULL, AV_LOG_TRACE, "DTLS: Read %d bytes, r0=%d, r1=%d\n", r0, r0, r1);
+        av_log(ctx, AV_LOG_TRACE, "DTLS: Read %d bytes, r0=%d, r1=%d\n", r0, r0, r1);
     }
 
     /* Check whether the DTLS is completed. */
@@ -733,8 +755,9 @@ static int dtls_context_write(DTLSContext *ctx, char* buf, int size)
     if (!ctx->dtls_srtp_key_exported) {
         ret = SSL_export_keying_material(dtls, ctx->dtls_srtp_materials, sizeof(ctx->dtls_srtp_materials),
             dst, strlen(dst), NULL, 0, 0);
+        r1 = openssl_ssl_get_error(ctx, r0);
         if (!ret) {
-            av_log(NULL, AV_LOG_ERROR, "DTLS: SSL export key r0=%lu, ret=%d\n", ERR_get_error(), ret);
+            av_log(ctx, AV_LOG_ERROR, "DTLS: SSL export key ret=%d, r1=%d %s\n", ret, r1, ctx->error_message);
             ret = AVERROR(EIO);
             goto end;
         }
@@ -901,14 +924,14 @@ static int dtls_context_on_state(DTLSContext *ctx, enum DTLSState state, const c
 
     if (state == DTLS_STATE_CLOSED) {
         rtc->dtls_closed = 1;
-        av_log(s, AV_LOG_INFO, "WHIP: DTLS session closed, type=%s, desc=%s, elapsed=%dms\n",
+        av_log(rtc, AV_LOG_INFO, "WHIP: DTLS session closed, type=%s, desc=%s, elapsed=%dms\n",
             type ? type : "", desc ? desc : "", ELAPSED(rtc->rtc_starttime, av_gettime()));
         return ret;
     }
 
     if (state == DTLS_STATE_FAILED) {
         rtc->state = RTC_STATE_FAILED;
-        av_log(s, AV_LOG_ERROR, "WHIP: DTLS session failed, type=%s, desc=%s\n",
+        av_log(rtc, AV_LOG_ERROR, "WHIP: DTLS session failed, type=%s, desc=%s\n",
             type ? type : "", desc ? desc : "");
         rtc->dtls_ret = AVERROR(EIO);
         return ret;
@@ -917,7 +940,7 @@ static int dtls_context_on_state(DTLSContext *ctx, enum DTLSState state, const c
     if (state == DTLS_STATE_FINISHED && rtc->state < RTC_STATE_DTLS_FINISHED) {
         rtc->state = RTC_STATE_DTLS_FINISHED;
         rtc->rtc_dtls_time = av_gettime();
-        av_log(s, AV_LOG_INFO, "WHIP: DTLS handshake, done=%d, exported=%d, arq=%d, srtp_material=%luB, cost=%dms, elapsed=%dms\n",
+        av_log(rtc, AV_LOG_INFO, "WHIP: DTLS handshake, done=%d, exported=%d, arq=%d, srtp_material=%luB, cost=%dms, elapsed=%dms\n",
             ctx->dtls_done_for_us, ctx->dtls_srtp_key_exported, ctx->dtls_arq_packets, sizeof(ctx->dtls_srtp_materials),
             ELAPSED(ctx->dtls_handshake_starttime, ctx->dtls_handshake_endtime),
             ELAPSED(rtc->rtc_starttime, av_gettime()));
@@ -936,7 +959,7 @@ static int dtls_context_on_write(DTLSContext *ctx, char* data, int size)
     RTCContext *rtc = s->priv_data;
 
     if (!rtc->udp_uc) {
-        av_log(s, AV_LOG_ERROR, "WHIP: DTLS write data, but udp_uc is NULL\n");
+        av_log(rtc, AV_LOG_ERROR, "WHIP: DTLS write data, but udp_uc is NULL\n");
         return AVERROR(EIO);
     }
 
@@ -954,24 +977,25 @@ static av_cold int whip_init(AVFormatContext *s)
     rtc->rtc_starttime = av_gettime();
 
     /* Use the same logging context as AV format. */
+    rtc->dtls_ctx.av_class = rtc->av_class;
     rtc->dtls_ctx.mtu = rtc->pkt_size;
     rtc->dtls_ctx.opaque = s;
     rtc->dtls_ctx.on_state = dtls_context_on_state;
     rtc->dtls_ctx.on_write = dtls_context_on_write;
 
     if ((ret = dtls_context_init(&rtc->dtls_ctx)) < 0) {
-        av_log(s, AV_LOG_ERROR, "WHIP: Failed to init DTLS context\n");
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to init DTLS context\n");
         return ret;
     }
 
     if (rtc->pkt_size < ideal_pkt_size)
-        av_log(s, AV_LOG_WARNING, "WHIP: pkt_size=%d(<%d) is too small, may cause packet loss\n",
+        av_log(rtc, AV_LOG_WARNING, "WHIP: pkt_size=%d(<%d) is too small, may cause packet loss\n",
             rtc->pkt_size, ideal_pkt_size);
 
     if (rtc->state < RTC_STATE_INIT)
         rtc->state = RTC_STATE_INIT;
     rtc->rtc_init_time = av_gettime();
-    av_log(s, AV_LOG_INFO, "WHIP: Init state=%d, handshake_timeout=%dms, pkt_size=%d, elapsed=%dms\n",
+    av_log(rtc, AV_LOG_INFO, "WHIP: Init state=%d, handshake_timeout=%dms, pkt_size=%d, elapsed=%dms\n",
         rtc->state, rtc->handshake_timeout, rtc->pkt_size, ELAPSED(rtc->rtc_starttime, av_gettime()));
 
     return 0;
@@ -1003,7 +1027,7 @@ static int isom_read_avcc(AVFormatContext *s, uint8_t *extradata, int  extradata
     /* Not H.264 ISOM format, may be annexb etc. */
     if (extradata_size < 4 || extradata[0] != 1) {
         if (!ff_avc_find_startcode(extradata, extradata + extradata_size)) {
-            av_log(s, AV_LOG_ERROR, "Format must be ISOM or annexb\n");
+            av_log(rtc, AV_LOG_ERROR, "Format must be ISOM or annexb\n");
             return AVERROR_INVALIDDATA;
         }
         return 0;
@@ -1022,14 +1046,14 @@ static int isom_read_avcc(AVFormatContext *s, uint8_t *extradata, int  extradata
     nb_sps = avio_r8(pb); /* 3 bits reserved (111) + 5 bits number of sps */
 
     if (version != 1) {
-        av_log(s, AV_LOG_ERROR, "Invalid version=%d\n", version);
+        av_log(rtc, AV_LOG_ERROR, "Invalid version=%d\n", version);
         ret = AVERROR_INVALIDDATA;
         goto end;
     }
 
     rtc->avc_nal_length_size = (nal_length_size & 0x03) + 1;
     if (rtc->avc_nal_length_size == 3) {
-        av_log(s, AV_LOG_ERROR, "Invalid nal length size=%d\n", rtc->avc_nal_length_size);
+        av_log(rtc, AV_LOG_ERROR, "Invalid nal length size=%d\n", rtc->avc_nal_length_size);
         ret = AVERROR_INVALIDDATA;
         goto end;
     }
@@ -1037,14 +1061,14 @@ static int isom_read_avcc(AVFormatContext *s, uint8_t *extradata, int  extradata
     /* Read SPS */
     nb_sps &= 0x1f;
     if (nb_sps != 1 || avio_feof(pb)) {
-        av_log(s, AV_LOG_ERROR, "Invalid number of sps=%d, eof=%d\n", nb_sps, avio_feof(pb));
+        av_log(rtc, AV_LOG_ERROR, "Invalid number of sps=%d, eof=%d\n", nb_sps, avio_feof(pb));
         ret = AVERROR_INVALIDDATA;
         goto end;
     }
 
     rtc->avc_sps_size = avio_rb16(pb); /* sps size */
     if (rtc->avc_sps_size <= 0 || avio_feof(pb)) {
-        av_log(s, AV_LOG_ERROR, "Invalid sps size=%d, eof=%d\n", rtc->avc_sps_size, avio_feof(pb));
+        av_log(rtc, AV_LOG_ERROR, "Invalid sps size=%d, eof=%d\n", rtc->avc_sps_size, avio_feof(pb));
         ret = AVERROR_INVALIDDATA;
         goto end;
     }
@@ -1057,21 +1081,21 @@ static int isom_read_avcc(AVFormatContext *s, uint8_t *extradata, int  extradata
 
     ret = avio_read(pb, rtc->avc_sps, rtc->avc_sps_size); /* sps */
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to read sps, size=%d\n", rtc->avc_sps_size);
+        av_log(rtc, AV_LOG_ERROR, "Failed to read sps, size=%d\n", rtc->avc_sps_size);
         goto end;
     }
 
     /* Read PPS */
     nb_pps = avio_r8(pb); /* number of pps */
     if (nb_pps != 1 || avio_feof(pb)) {
-        av_log(s, AV_LOG_ERROR, "Invalid number of pps=%d, eof=%d\n", nb_pps, avio_feof(pb));
+        av_log(rtc, AV_LOG_ERROR, "Invalid number of pps=%d, eof=%d\n", nb_pps, avio_feof(pb));
         ret = AVERROR_INVALIDDATA;
         goto end;
     }
 
     rtc->avc_pps_size = avio_rb16(pb); /* pps size */
     if (rtc->avc_pps_size <= 0 || avio_feof(pb)) {
-        av_log(s, AV_LOG_ERROR, "Invalid pps size=%d, eof=%d\n", rtc->avc_pps_size, avio_feof(pb));
+        av_log(rtc, AV_LOG_ERROR, "Invalid pps size=%d, eof=%d\n", rtc->avc_pps_size, avio_feof(pb));
         ret = AVERROR_INVALIDDATA;
         goto end;
     }
@@ -1084,7 +1108,7 @@ static int isom_read_avcc(AVFormatContext *s, uint8_t *extradata, int  extradata
 
     ret = avio_read(pb, rtc->avc_pps, rtc->avc_pps_size); /* pps */
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to read pps, size=%d\n", rtc->avc_pps_size);
+        av_log(rtc, AV_LOG_ERROR, "Failed to read pps, size=%d\n", rtc->avc_pps_size);
         goto end;
     }
 
@@ -1116,54 +1140,54 @@ static int parse_codec(AVFormatContext *s)
         switch (par->codec_type) {
         case AVMEDIA_TYPE_VIDEO:
             if (rtc->video_par) {
-                av_log(s, AV_LOG_ERROR, "Only one video stream is supported by RTC\n");
+                av_log(rtc, AV_LOG_ERROR, "Only one video stream is supported by RTC\n");
                 return AVERROR(EINVAL);
             }
             rtc->video_par = par;
 
             if (par->codec_id != AV_CODEC_ID_H264) {
-                av_log(s, AV_LOG_ERROR, "Unsupported video codec %s by RTC, choose h264\n",
+                av_log(rtc, AV_LOG_ERROR, "Unsupported video codec %s by RTC, choose h264\n",
                        desc ? desc->name : "unknown");
                 return AVERROR_PATCHWELCOME;
             }
 
             if (par->video_delay > 0) {
-                av_log(s, AV_LOG_ERROR, "Unsupported B frames by RTC\n");
+                av_log(rtc, AV_LOG_ERROR, "Unsupported B frames by RTC\n");
                 return AVERROR_PATCHWELCOME;
             }
 
             ret = isom_read_avcc(s, par->extradata, par->extradata_size);
             if (ret < 0) {
-                av_log(s, AV_LOG_ERROR, "Failed to parse SPS/PPS from extradata\n");
+                av_log(rtc, AV_LOG_ERROR, "Failed to parse SPS/PPS from extradata\n");
                 return ret;
             }
             break;
         case AVMEDIA_TYPE_AUDIO:
             if (rtc->audio_par) {
-                av_log(s, AV_LOG_ERROR, "Only one audio stream is supported by RTC\n");
+                av_log(rtc, AV_LOG_ERROR, "Only one audio stream is supported by RTC\n");
                 return AVERROR(EINVAL);
             }
             rtc->audio_par = par;
 
             if (par->codec_id != AV_CODEC_ID_OPUS) {
-                av_log(s, AV_LOG_ERROR, "Unsupported audio codec %s by RTC, choose opus\n",
+                av_log(rtc, AV_LOG_ERROR, "Unsupported audio codec %s by RTC, choose opus\n",
                     desc ? desc->name : "unknown");
                 return AVERROR_PATCHWELCOME;
             }
 
             if (par->ch_layout.nb_channels != 2) {
-                av_log(s, AV_LOG_ERROR, "Unsupported audio channels %d by RTC, choose stereo\n",
+                av_log(rtc, AV_LOG_ERROR, "Unsupported audio channels %d by RTC, choose stereo\n",
                     par->ch_layout.nb_channels);
                 return AVERROR_PATCHWELCOME;
             }
 
             if (par->sample_rate != 48000) {
-                av_log(s, AV_LOG_ERROR, "Unsupported audio sample rate %d by RTC, choose 48000\n", par->sample_rate);
+                av_log(rtc, AV_LOG_ERROR, "Unsupported audio sample rate %d by RTC, choose 48000\n", par->sample_rate);
                 return AVERROR_PATCHWELCOME;
             }
             break;
         default:
-            av_log(s, AV_LOG_ERROR, "Codec type '%s' for stream %d is not supported by RTC\n",
+            av_log(rtc, AV_LOG_ERROR, "Codec type '%s' for stream %d is not supported by RTC\n",
                    av_get_media_type_string(par->codec_type), i);
             return AVERROR_PATCHWELCOME;
         }
@@ -1190,7 +1214,7 @@ static int generate_sdp_offer(AVFormatContext *s)
     av_bprint_init(&bp, 1, MAX_SDP_SIZE);
 
     if (rtc->sdp_offer) {
-        av_log(s, AV_LOG_ERROR, "SDP offer is already set\n");
+        av_log(rtc, AV_LOG_ERROR, "SDP offer is already set\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
@@ -1216,7 +1240,7 @@ static int generate_sdp_offer(AVFormatContext *s)
         "a=extmap-allow-mixed\r\n"
         "a=msid-semantic: WMS\r\n");
     if (!av_bprint_is_complete(&bp)) {
-        av_log(s, AV_LOG_ERROR, "Offer %d exceed max %d, %s\n", ret, MAX_SDP_SIZE, bp.str);
+        av_log(rtc, AV_LOG_ERROR, "Offer %d exceed max %d, %s\n", ret, MAX_SDP_SIZE, bp.str);
         ret = AVERROR(EIO);
         goto end;
     }
@@ -1246,7 +1270,7 @@ static int generate_sdp_offer(AVFormatContext *s)
             rtc->audio_ssrc,
             rtc->audio_ssrc);
         if (!av_bprint_is_complete(&bp)) {
-            av_log(s, AV_LOG_ERROR, "Offer %d exceed max %d, %s\n", ret, MAX_SDP_SIZE, bp.str);
+            av_log(rtc, AV_LOG_ERROR, "Offer %d exceed max %d, %s\n", ret, MAX_SDP_SIZE, bp.str);
             ret = AVERROR(EIO);
             goto end;
         }
@@ -1284,7 +1308,7 @@ static int generate_sdp_offer(AVFormatContext *s)
             rtc->video_ssrc,
             rtc->video_ssrc);
         if (!av_bprint_is_complete(&bp)) {
-            av_log(s, AV_LOG_ERROR, "Offer %d exceed max %d, %s\n", ret, MAX_SDP_SIZE, bp.str);
+            av_log(rtc, AV_LOG_ERROR, "Offer %d exceed max %d, %s\n", ret, MAX_SDP_SIZE, bp.str);
             ret = AVERROR(EIO);
             goto end;
         }
@@ -1299,7 +1323,7 @@ static int generate_sdp_offer(AVFormatContext *s)
     if (rtc->state < RTC_STATE_OFFER)
         rtc->state = RTC_STATE_OFFER;
     rtc->rtc_offer_time = av_gettime();
-    av_log(s, AV_LOG_VERBOSE, "WHIP: Generated state=%d, offer: %s\n", rtc->state, rtc->sdp_offer);
+    av_log(rtc, AV_LOG_VERBOSE, "WHIP: Generated state=%d, offer: %s\n", rtc->state, rtc->sdp_offer);
 
 end:
     av_bprint_finalize(&bp, NULL);
@@ -1325,12 +1349,12 @@ static int exchange_sdp(AVFormatContext *s)
 
     ret = ffurl_alloc(&whip_uc, s->url, AVIO_FLAG_READ_WRITE, &s->interrupt_callback);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to alloc HTTP context: %s\n", s->url);
+        av_log(rtc, AV_LOG_ERROR, "Failed to alloc HTTP context: %s\n", s->url);
         goto end;
     }
 
     if (!rtc->sdp_offer || !strlen(rtc->sdp_offer)) {
-        av_log(s, AV_LOG_ERROR, "No offer to exchange\n");
+        av_log(rtc, AV_LOG_ERROR, "No offer to exchange\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
@@ -1341,7 +1365,7 @@ static int exchange_sdp(AVFormatContext *s)
     if (rtc->authorization)
         ret += snprintf(buf + ret, sizeof(buf) - ret, "Authorization: Bearer %s\r\n", rtc->authorization);
     if (ret <= 0 || ret >= sizeof(buf)) {
-        av_log(s, AV_LOG_ERROR, "Failed to generate headers, size=%d, %s\n", ret, buf);
+        av_log(rtc, AV_LOG_ERROR, "Failed to generate headers, size=%d, %s\n", ret, buf);
         ret = AVERROR(EINVAL);
         goto end;
     }
@@ -1352,7 +1376,7 @@ static int exchange_sdp(AVFormatContext *s)
 
     ret = ffurl_connect(whip_uc, NULL);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to request url=%s, offer: %s\n", s->url, rtc->sdp_offer);
+        av_log(rtc, AV_LOG_ERROR, "Failed to request url=%s, offer: %s\n", s->url, rtc->sdp_offer);
         goto end;
     }
 
@@ -1372,21 +1396,21 @@ static int exchange_sdp(AVFormatContext *s)
             break;
         }
         if (ret <= 0) {
-            av_log(s, AV_LOG_ERROR, "Failed to read response from url=%s, offer is %s, answer is %s\n",
+            av_log(rtc, AV_LOG_ERROR, "Failed to read response from url=%s, offer is %s, answer is %s\n",
                 s->url, rtc->sdp_offer, rtc->sdp_answer);
             goto end;
         }
 
         av_bprintf(&bp, "%.*s", ret, buf);
         if (!av_bprint_is_complete(&bp)) {
-            av_log(s, AV_LOG_ERROR, "Answer %d exceed max size %d, %s\n", ret, MAX_SDP_SIZE, bp.str);
+            av_log(rtc, AV_LOG_ERROR, "Answer %d exceed max size %d, %s\n", ret, MAX_SDP_SIZE, bp.str);
             ret = AVERROR(EIO);
             goto end;
         }
     }
 
     if (!av_strstart(bp.str, "v=", NULL)) {
-        av_log(s, AV_LOG_ERROR, "Invalid answer: %s\n", bp.str);
+        av_log(rtc, AV_LOG_ERROR, "Invalid answer: %s\n", bp.str);
         ret = AVERROR(EINVAL);
         goto end;
     }
@@ -1399,7 +1423,7 @@ static int exchange_sdp(AVFormatContext *s)
 
     if (rtc->state < RTC_STATE_ANSWER)
         rtc->state = RTC_STATE_ANSWER;
-    av_log(s, AV_LOG_VERBOSE, "WHIP: Got state=%d, answer: %s\n", rtc->state, rtc->sdp_answer);
+    av_log(rtc, AV_LOG_VERBOSE, "WHIP: Got state=%d, answer: %s\n", rtc->state, rtc->sdp_answer);
 
 end:
     ffurl_closep(&whip_uc);
@@ -1428,7 +1452,7 @@ static int parse_answer(AVFormatContext *s)
     RTCContext *rtc = s->priv_data;
 
     if (!rtc->sdp_answer || !strlen(rtc->sdp_answer)) {
-        av_log(s, AV_LOG_ERROR, "No answer to parse\n");
+        av_log(rtc, AV_LOG_ERROR, "No answer to parse\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
@@ -1458,14 +1482,14 @@ static int parse_answer(AVFormatContext *s)
                 int priority, port;
                 ret = sscanf(ptr, "%16s %d %128s %d typ host", protocol, &priority, host, &port);
                 if (ret != 4) {
-                    av_log(s, AV_LOG_ERROR, "Failed %d to parse line %d %s from %s\n",
+                    av_log(rtc, AV_LOG_ERROR, "Failed %d to parse line %d %s from %s\n",
                         ret, i, line, rtc->sdp_answer);
                     ret = AVERROR(EIO);
                     goto end;
                 }
 
                 if (av_strcasecmp(protocol, "udp")) {
-                    av_log(s, AV_LOG_ERROR, "Protocol %s is not supported by RTC, choose udp, line %d %s of %s\n",
+                    av_log(rtc, AV_LOG_ERROR, "Protocol %s is not supported by RTC, choose udp, line %d %s of %s\n",
                         protocol, i, line, rtc->sdp_answer);
                     ret = AVERROR(EIO);
                     goto end;
@@ -1483,19 +1507,19 @@ static int parse_answer(AVFormatContext *s)
     }
 
     if (!rtc->ice_pwd_remote || !strlen(rtc->ice_pwd_remote)) {
-        av_log(s, AV_LOG_ERROR, "No remote ice pwd parsed from %s\n", rtc->sdp_answer);
+        av_log(rtc, AV_LOG_ERROR, "No remote ice pwd parsed from %s\n", rtc->sdp_answer);
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     if (!rtc->ice_ufrag_remote || !strlen(rtc->ice_ufrag_remote)) {
-        av_log(s, AV_LOG_ERROR, "No remote ice ufrag parsed from %s\n", rtc->sdp_answer);
+        av_log(rtc, AV_LOG_ERROR, "No remote ice ufrag parsed from %s\n", rtc->sdp_answer);
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     if (!rtc->ice_protocol || !rtc->ice_host || !rtc->ice_port) {
-        av_log(s, AV_LOG_ERROR, "No ice candidate parsed from %s\n", rtc->sdp_answer);
+        av_log(rtc, AV_LOG_ERROR, "No ice candidate parsed from %s\n", rtc->sdp_answer);
         ret = AVERROR(EINVAL);
         goto end;
     }
@@ -1503,7 +1527,7 @@ static int parse_answer(AVFormatContext *s)
     if (rtc->state < RTC_STATE_NEGOTIATED)
         rtc->state = RTC_STATE_NEGOTIATED;
     rtc->rtc_answer_time = av_gettime();
-    av_log(s, AV_LOG_INFO, "WHIP: SDP state=%d, offer=%luB, answer=%luB, ufrag=%s, pwd=%luB, transport=%s://%s:%d, elapsed=%dms\n",
+    av_log(rtc, AV_LOG_INFO, "WHIP: SDP state=%d, offer=%luB, answer=%luB, ufrag=%s, pwd=%luB, transport=%s://%s:%d, elapsed=%dms\n",
         rtc->state, strlen(rtc->sdp_offer), strlen(rtc->sdp_answer), rtc->ice_ufrag_remote, strlen(rtc->ice_pwd_remote),
         rtc->ice_protocol, rtc->ice_host, rtc->ice_port, ELAPSED(rtc->rtc_starttime, av_gettime()));
 
@@ -1554,7 +1578,7 @@ static int ice_create_request(AVFormatContext *s, uint8_t *buf, int buf_size, in
     /* The username is the concatenation of the two ICE ufrag */
     ret = snprintf(username, sizeof(username), "%s:%s", rtc->ice_ufrag_remote, rtc->ice_ufrag_local);
     if (ret <= 0 || ret >= sizeof(username)) {
-        av_log(s, AV_LOG_ERROR, "Failed to build username %s:%s, max=%lu, ret=%d\n",
+        av_log(rtc, AV_LOG_ERROR, "Failed to build username %s:%s, max=%lu, ret=%d\n",
             rtc->ice_ufrag_remote, rtc->ice_ufrag_local, sizeof(username), ret);
         ret = AVERROR(EIO);
         goto end;
@@ -1622,7 +1646,7 @@ static int ice_create_response(AVFormatContext *s, char *tid, int tid_size, uint
     RTCContext *rtc = s->priv_data;
 
     if (tid_size != 12) {
-        av_log(s, AV_LOG_ERROR, "Invalid transaction ID size. Expected 12, got %d\n", tid_size);
+        av_log(rtc, AV_LOG_ERROR, "Invalid transaction ID size. Expected 12, got %d\n", tid_size);
         return AVERROR(EINVAL);
     }
 
@@ -1695,7 +1719,7 @@ static int ice_handle_binding_request(AVFormatContext *s, char *buf, int buf_siz
         return ret;
 
     if (buf_size < 20) {
-        av_log(s, AV_LOG_ERROR, "Invalid STUN message size. Expected at least 20, got %d\n", buf_size);
+        av_log(rtc, AV_LOG_ERROR, "Invalid STUN message size. Expected at least 20, got %d\n", buf_size);
         return AVERROR(EINVAL);
     }
 
@@ -1705,13 +1729,13 @@ static int ice_handle_binding_request(AVFormatContext *s, char *buf, int buf_siz
     /* Build the STUN binding response. */
     ret = ice_create_response(s, tid, sizeof(tid), rtc->buf, sizeof(rtc->buf), &size);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to create STUN binding response, size=%d\n", size);
+        av_log(rtc, AV_LOG_ERROR, "Failed to create STUN binding response, size=%d\n", size);
         return ret;
     }
 
     ret = ffurl_write(rtc->udp_uc, rtc->buf, size);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to send STUN binding response, size=%d\n", size);
+        av_log(rtc, AV_LOG_ERROR, "Failed to send STUN binding response, size=%d\n", size);
         return ret;
     }
 
@@ -1733,7 +1757,7 @@ static int udp_connect(AVFormatContext *s)
     ff_url_join(url, sizeof(url), "udp", NULL, rtc->ice_host, rtc->ice_port, NULL);
     ret = ffurl_alloc(&rtc->udp_uc, url, AVIO_FLAG_WRITE, &s->interrupt_callback);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to open udp://%s:%d\n", rtc->ice_host, rtc->ice_port);
+        av_log(rtc, AV_LOG_ERROR, "Failed to open udp://%s:%d\n", rtc->ice_host, rtc->ice_port);
         return ret;
     }
 
@@ -1745,7 +1769,7 @@ static int udp_connect(AVFormatContext *s)
 
     ret = ffurl_connect(rtc->udp_uc, NULL);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to connect udp://%s:%d\n", rtc->ice_host, rtc->ice_port);
+        av_log(rtc, AV_LOG_ERROR, "Failed to connect udp://%s:%d\n", rtc->ice_host, rtc->ice_port);
         return ret;
     }
 
@@ -1756,7 +1780,7 @@ static int udp_connect(AVFormatContext *s)
     if (rtc->state < RTC_STATE_UDP_CONNECTED)
         rtc->state = RTC_STATE_UDP_CONNECTED;
     rtc->rtc_udp_time = av_gettime();
-    av_log(s, AV_LOG_VERBOSE, "WHIP: UDP state=%d, elapsed=%dms, connected to udp://%s:%d\n",
+    av_log(rtc, AV_LOG_VERBOSE, "WHIP: UDP state=%d, elapsed=%dms, connected to udp://%s:%d\n",
         rtc->state, ELAPSED(rtc->rtc_starttime, av_gettime()), rtc->ice_host, rtc->ice_port);
 
     return ret;
@@ -1769,7 +1793,7 @@ static int ice_dtls_handshake(AVFormatContext *s)
     RTCContext *rtc = s->priv_data;
 
     if (rtc->state < RTC_STATE_UDP_CONNECTED || !rtc->udp_uc) {
-        av_log(s, AV_LOG_ERROR, "WHIP: UDP not connected, state=%d, udp_uc=%p\n", rtc->state, rtc->udp_uc);
+        av_log(rtc, AV_LOG_ERROR, "WHIP: UDP not connected, state=%d, udp_uc=%p\n", rtc->state, rtc->udp_uc);
         return AVERROR(EINVAL);
     }
 
@@ -1778,13 +1802,13 @@ static int ice_dtls_handshake(AVFormatContext *s)
             /* Build the STUN binding request. */
             ret = ice_create_request(s, rtc->buf, sizeof(rtc->buf), &size);
             if (ret < 0) {
-                av_log(s, AV_LOG_ERROR, "Failed to create STUN binding request, size=%d\n", size);
+                av_log(rtc, AV_LOG_ERROR, "Failed to create STUN binding request, size=%d\n", size);
                 goto end;
             }
 
             ret = ffurl_write(rtc->udp_uc, rtc->buf, size);
             if (ret < 0) {
-                av_log(s, AV_LOG_ERROR, "Failed to send STUN binding request, size=%d\n", size);
+                av_log(rtc, AV_LOG_ERROR, "Failed to send STUN binding request, size=%d\n", size);
                 goto end;
             }
 
@@ -1799,7 +1823,7 @@ next_packet:
 
         now = av_gettime();
         if (now - starttime >= rtc->handshake_timeout * 1000) {
-            av_log(s, AV_LOG_ERROR, "WHIP: DTLS handshake timeout=%dms, cost=%dms, elapsed=%dms, state=%d\n",
+            av_log(rtc, AV_LOG_ERROR, "WHIP: DTLS handshake timeout=%dms, cost=%dms, elapsed=%dms, state=%d\n",
                 rtc->handshake_timeout, ELAPSED(starttime, now), ELAPSED(rtc->rtc_starttime, now), rtc->state);
             ret = AVERROR(ETIMEDOUT);
             goto end;
@@ -1814,7 +1838,7 @@ next_packet:
                 av_usleep(5 * 1000);
                 continue;
             }
-            av_log(s, AV_LOG_ERROR, "Failed to read message\n");
+            av_log(rtc, AV_LOG_ERROR, "Failed to read message\n");
             goto end;
         }
 
@@ -1827,7 +1851,7 @@ next_packet:
             if (rtc->state < RTC_STATE_ICE_CONNECTED) {
                 rtc->state = RTC_STATE_ICE_CONNECTED;
                 rtc->rtc_ice_time = av_gettime();
-                av_log(s, AV_LOG_INFO, "WHIP: ICE STUN ok, state=%d, url=udp://%s:%d, location=%s, username=%s:%s, res=%dB, elapsed=%dms\n",
+                av_log(rtc, AV_LOG_INFO, "WHIP: ICE STUN ok, state=%d, url=udp://%s:%d, location=%s, username=%s:%s, res=%dB, elapsed=%dms\n",
                     rtc->state, rtc->ice_host, rtc->ice_port, rtc->whip_resource_url ? rtc->whip_resource_url : "",
                     rtc->ice_ufrag_remote, rtc->ice_ufrag_local, ret, ELAPSED(rtc->rtc_starttime, av_gettime()));
 
@@ -1896,46 +1920,46 @@ static int setup_srtp(AVFormatContext *s)
 
     /* Setup SRTP context for outgoing packets */
     if (!av_base64_encode(buf, sizeof(buf), send_key, sizeof(send_key))) {
-        av_log(s, AV_LOG_ERROR, "Failed to encode send key\n");
+        av_log(rtc, AV_LOG_ERROR, "Failed to encode send key\n");
         ret = AVERROR(EIO);
         goto end;
     }
 
     ret = ff_srtp_set_crypto(&rtc->srtp_audio_send, suite, buf);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to set crypto for audio send\n");
+        av_log(rtc, AV_LOG_ERROR, "Failed to set crypto for audio send\n");
         goto end;
     }
 
     ret = ff_srtp_set_crypto(&rtc->srtp_video_send, suite, buf);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to set crypto for video send\n");
+        av_log(rtc, AV_LOG_ERROR, "Failed to set crypto for video send\n");
         goto end;
     }
 
     ret = ff_srtp_set_crypto(&rtc->srtp_rtcp_send, suite, buf);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to set crypto for rtcp send\n");
+        av_log(rtc, AV_LOG_ERROR, "Failed to set crypto for rtcp send\n");
         goto end;
     }
 
     /* Setup SRTP context for incoming packets */
     if (!av_base64_encode(buf, sizeof(buf), recv_key, sizeof(recv_key))) {
-        av_log(s, AV_LOG_ERROR, "Failed to encode recv key\n");
+        av_log(rtc, AV_LOG_ERROR, "Failed to encode recv key\n");
         ret = AVERROR(EIO);
         goto end;
     }
 
     ret = ff_srtp_set_crypto(&rtc->srtp_recv, suite, buf);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to set crypto for recv\n");
+        av_log(rtc, AV_LOG_ERROR, "Failed to set crypto for recv\n");
         goto end;
     }
 
     if (rtc->state < RTC_STATE_SRTP_FINISHED)
         rtc->state = RTC_STATE_SRTP_FINISHED;
     rtc->rtc_srtp_time = av_gettime();
-    av_log(s, AV_LOG_INFO, "WHIP: SRTP setup done, state=%d, suite=%s, key=%luB, elapsed=%dms\n",
+    av_log(rtc, AV_LOG_INFO, "WHIP: SRTP setup done, state=%d, suite=%s, key=%luB, elapsed=%dms\n",
         rtc->state, suite, sizeof(send_key), ELAPSED(rtc->rtc_starttime, av_gettime()));
 
 end:
@@ -1966,7 +1990,7 @@ static int create_rtp_muxer(AVFormatContext *s)
 
     const AVOutputFormat *rtp_format = av_guess_format("rtp", NULL, NULL);
     if (!rtp_format) {
-        av_log(s, AV_LOG_ERROR, "Failed to guess rtp muxer\n");
+        av_log(rtc, AV_LOG_ERROR, "Failed to guess rtp muxer\n");
         ret = AVERROR(ENOSYS);
         goto end;
     }
@@ -2025,7 +2049,7 @@ static int create_rtp_muxer(AVFormatContext *s)
 
         ret = avformat_write_header(rtp_ctx, &opts);
         if (ret < 0) {
-            av_log(s, AV_LOG_ERROR, "Failed to write rtp header\n");
+            av_log(rtc, AV_LOG_ERROR, "Failed to write rtp header\n");
             goto end;
         }
 
@@ -2038,7 +2062,7 @@ static int create_rtp_muxer(AVFormatContext *s)
     if (rtc->state < RTC_STATE_READY)
         rtc->state = RTC_STATE_READY;
     rtc->rtc_ready_time = av_gettime();
-    av_log(s, AV_LOG_INFO, "WHIP: Muxer is ready, state=%d, buffer_size=%d, max_packet_size=%d, "
+    av_log(rtc, AV_LOG_INFO, "WHIP: Muxer is ready, state=%d, buffer_size=%d, max_packet_size=%d, "
                            "elapsed=%dms(init:%d,offer:%d,answer:%d,udp:%d,ice:%d,dtls:%d,srtp:%d,ready:%d)\n",
         rtc->state, buffer_size, max_packet_size, ELAPSED(rtc->rtc_starttime, av_gettime()),
         ELAPSED(rtc->rtc_starttime, rtc->rtc_init_time),
@@ -2109,13 +2133,13 @@ static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size)
     /* Encrypt by SRTP and send out. */
     cipher_size = ff_srtp_encrypt(srtp, buf, buf_size, rtc->buf, sizeof(rtc->buf));
     if (cipher_size <= 0 || cipher_size < buf_size) {
-        av_log(s, AV_LOG_WARNING, "Failed to encrypt packet=%dB, cipher=%dB\n", buf_size, cipher_size);
+        av_log(rtc, AV_LOG_WARNING, "Failed to encrypt packet=%dB, cipher=%dB\n", buf_size, cipher_size);
         return 0;
     }
 
     ret = ffurl_write(rtc->udp_uc, rtc->buf, cipher_size);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to write packet=%dB, ret=%d\n", cipher_size, ret);
+        av_log(rtc, AV_LOG_ERROR, "Failed to write packet=%dB, ret=%d\n", cipher_size, ret);
         return ret;
     }
 
@@ -2150,7 +2174,7 @@ static int insert_sps_pps_packet(AVFormatContext *s, AVPacket *pkt)
             rtc->avc_nal_length_size * 2 + rtc->avc_sps_size + rtc->avc_pps_size;
     ret = av_new_packet(extra, size);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to allocate extra packet\n");
+        av_log(rtc, AV_LOG_ERROR, "Failed to allocate extra packet\n");
         goto end;
     }
 
@@ -2209,7 +2233,7 @@ static int whip_dispose(AVFormatContext *s)
 
     ret = ffurl_alloc(&whip_uc, rtc->whip_resource_url, AVIO_FLAG_READ_WRITE, &s->interrupt_callback);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to alloc WHIP delete context: %s\n", s->url);
+        av_log(rtc, AV_LOG_ERROR, "Failed to alloc WHIP delete context: %s\n", s->url);
         goto end;
     }
 
@@ -2217,7 +2241,7 @@ static int whip_dispose(AVFormatContext *s)
     av_opt_set(whip_uc->priv_data, "method", "DELETE", 0);
     ret = ffurl_connect(whip_uc, NULL);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to DELETE url=%s\n", rtc->whip_resource_url);
+        av_log(rtc, AV_LOG_ERROR, "Failed to DELETE url=%s\n", rtc->whip_resource_url);
         goto end;
     }
 
@@ -2228,12 +2252,12 @@ static int whip_dispose(AVFormatContext *s)
             break;
         }
         if (ret < 0) {
-            av_log(s, AV_LOG_ERROR, "Failed to read response from DELETE url=%s\n", rtc->whip_resource_url);
+            av_log(rtc, AV_LOG_ERROR, "Failed to read response from DELETE url=%s\n", rtc->whip_resource_url);
             goto end;
         }
     }
 
-    av_log(s, AV_LOG_INFO, "WHIP: Dispose resource %s ok\n", rtc->whip_resource_url);
+    av_log(rtc, AV_LOG_INFO, "WHIP: Dispose resource %s ok\n", rtc->whip_resource_url);
 
 end:
     ffurl_closep(&whip_uc);
@@ -2297,12 +2321,12 @@ static int rtc_write_packet(AVFormatContext *s, AVPacket *pkt)
     if (ret > 0) {
         if (is_dtls_packet(rtc->buf, ret)) {
             if ((ret = dtls_context_write(&rtc->dtls_ctx, rtc->buf, ret)) < 0) {
-                av_log(s, AV_LOG_ERROR, "Failed to handle DTLS message\n");
+                av_log(rtc, AV_LOG_ERROR, "Failed to handle DTLS message\n");
                 goto end;
             }
         }
     } else if (ret != AVERROR(EAGAIN)) {
-        av_log(s, AV_LOG_ERROR, "Failed to read from UDP socket\n");
+        av_log(rtc, AV_LOG_ERROR, "Failed to read from UDP socket\n");
         goto end;
     }
 
@@ -2319,17 +2343,17 @@ static int rtc_write_packet(AVFormatContext *s, AVPacket *pkt)
 
     ret = insert_sps_pps_packet(s, pkt);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to insert SPS/PPS packet\n");
+        av_log(rtc, AV_LOG_ERROR, "Failed to insert SPS/PPS packet\n");
         goto end;
     }
 
     ret = ff_write_chained(rtp_ctx, 0, pkt, s, 0);
     if (ret < 0) {
         if (ret == AVERROR(EINVAL)) {
-            av_log(s, AV_LOG_WARNING, "Ignore failed to write packet=%dB, ret=%d\n", pkt->size, ret);
+            av_log(rtc, AV_LOG_WARNING, "Ignore failed to write packet=%dB, ret=%d\n", pkt->size, ret);
             ret = 0;
         } else
-            av_log(s, AV_LOG_ERROR, "Failed to write packet, size=%d\n", pkt->size);
+            av_log(rtc, AV_LOG_ERROR, "Failed to write packet, size=%d\n", pkt->size);
         goto end;
     }
 
@@ -2350,7 +2374,7 @@ static av_cold void rtc_deinit(AVFormatContext *s)
 
     ret = whip_dispose(s);
     if (ret < 0)
-        av_log(s, AV_LOG_WARNING, "Failed to dispose resource, ret=%d\n", ret);
+        av_log(rtc, AV_LOG_WARNING, "Failed to dispose resource, ret=%d\n", ret);
 
     for (i = 0; i < s->nb_streams; i++) {
         AVFormatContext* rtp_ctx = s->streams[i]->priv_data;
