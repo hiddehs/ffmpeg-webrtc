@@ -536,8 +536,12 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
     BIO *bio_in = NULL, *bio_out = NULL;
     const char* ciphers = "ALL";
     const char* profiles = "SRTP_AES128_CM_SHA1_80";
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L /* OpenSSL 1.0.2 */
-    const char* curves = "P-521:P-384:P-256";
+
+    /* Refer to the test cases regarding these curves in the WebRTC code. */
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L /* OpenSSL 1.1.0 */
+    const char* curves = "X25519:P-256:P-384:P-521";
+#elif OPENSSL_VERSION_NUMBER >= 0x10002000L /* OpenSSL 1.0.2 */
+    const char* curves = "P-256:P-384:P-521";
 #endif
 
 #if OPENSSL_VERSION_NUMBER < 0x10002000L /* OpenSSL v1.0.2 */
