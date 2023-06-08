@@ -2535,7 +2535,7 @@ static const AVOption options[] = {
 };
 
 static const AVClass rtc_muxer_class = {
-    .class_name = "WebRTC muxer",
+    .class_name = "WHIP muxer",
     .item_name  = av_default_item_name,
     .option     = options,
     .version    = LIBAVUTIL_VERSION_INT,
@@ -2543,7 +2543,7 @@ static const AVClass rtc_muxer_class = {
 
 const FFOutputFormat ff_rtc_muxer = {
     .p.name             = "rtc",
-    .p.long_name        = NULL_IF_CONFIG_SMALL("WHIP WebRTC muxer"),
+    .p.long_name        = NULL_IF_CONFIG_SMALL("WHIP(WebRTC-HTTP ingestion protocol) muxer"),
     .p.audio_codec      = AV_CODEC_ID_OPUS,
     .p.video_codec      = AV_CODEC_ID_H264,
     .p.flags            = AVFMT_GLOBALHEADER | AVFMT_NOFILE,
