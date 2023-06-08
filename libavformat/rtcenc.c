@@ -1288,6 +1288,11 @@ static int parse_codec(AVFormatContext *s)
                 av_log(rtc, AV_LOG_ERROR, "WHIP: Unsupported audio sample rate %d by RTC, choose 48000\n", par->sample_rate);
                 return AVERROR_PATCHWELCOME;
             }
+
+            if (rtc->audio_par->frame_size <= 0) {
+                av_log(rtc, AV_LOG_ERROR, "WHIP: Unsupported audio frame size %d by RTC\n", rtc->audio_par->frame_size);
+                return AVERROR_PATCHWELCOME;
+            }
             break;
         default:
             av_log(rtc, AV_LOG_ERROR, "WHIP: Codec type '%s' for stream %d is not supported by RTC\n",
@@ -2469,7 +2474,7 @@ static int rtc_write_packet(AVFormatContext *s, AVPacket *pkt)
          *  Although we are unsure of the root cause, we can simply correct the timestamp by using the timebase of
          *  Opus. We need to conduct further research and remove this line.
          */
-        rtc->audio_jitter_base += 960;
+        rtc->audio_jitter_base += rtc->audio_par->frame_size;
     }
 
     ret = insert_sps_pps_packet(s, pkt);
