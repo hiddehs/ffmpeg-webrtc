@@ -19,29 +19,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "config.h"
-
-#ifndef CONFIG_OPENSSL
-#error "DTLS is not supported, please enable openssl"
-#else
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-/**
- * Minimum required version of OpenSSL.
- *          MM NN FF PP S
- * 0x1010102fL = 0x1 01 01 02 fL            // 1.1.1b release
- *   MM(major) = 0x1                        // 1.*
- *     NN(minor) = 0x01                     // 1.1.*
- *          FF(fix) = 0x01                  // 1.1.1*
- *     PP(patch) = 'a' + 0x02 - 1 = 'b'     // 1.1.1b *
- *              S(status) = 0xf = release   // 1.1.1b release
- * Status 0 for development, 1 to e for betas 1 to 14, and f for release.
- * Please use the stable version for DTLS, see https://github.com/openssl/openssl/issues/346
- */
-#if OPENSSL_VERSION_NUMBER < 0x100010b0L /* OpenSSL 1.0.1k */
-#error "OpenSSL version 1.0.1k or newer is required"
-#endif
-#endif
 
 #include "libavcodec/avcodec.h"
 #include "libavutil/base64.h"
@@ -78,11 +57,9 @@
  * that is exported by Secure Sockets Layer (SSL) after a successful Datagram
  * Transport Layer Security (DTLS) handshake. This material consists of a key
  * of 16 bytes and a salt of 14 bytes.
- *
- * The material is exported by SSL in the following format: client_key (16 bytes) |
- * server_key (16 bytes) | client_salt (14 bytes) | server_salt (14 bytes).
  */
-#define DTLS_SRTP_MASTER_KEY_LEN 30
+#define DTLS_SRTP_KEY_LEN 16
+#define DTLS_SRTP_SALT_LEN 14
 /**
  * The maximum size of the Secure Real-time Transport Protocol (SRTP) HMAC checksum
  * and padding that is appended to the end of the packet. To calculate the maximum
@@ -142,9 +119,6 @@ typedef struct DTLSContext {
     DTLSContext_on_write_fn on_write;
     void* opaque;
 
-    /* For av_log to write log to this category. */
-    void *log_avcl;
-
     /* The DTLS context. */
     SSL_CTX *dtls_ctx;
     SSL *dtls;
@@ -166,7 +140,7 @@ typedef struct DTLSContext {
      *          16B         16B         14B             14B
      *      client_key | server_key | client_salt | server_salt
      */
-    uint8_t dtls_srtp_material[DTLS_SRTP_MASTER_KEY_LEN * 2];
+    uint8_t dtls_srtp_materials[(DTLS_SRTP_KEY_LEN + DTLS_SRTP_SALT_LEN) * 2];
 
     /* Whether the DTLS is done at least for us. */
     int dtls_done_for_us;
@@ -207,7 +181,6 @@ static void openssl_dtls_on_info(const SSL *dtls, int where, int r0)
     const char *method = "undefined", *alert_type, *alert_desc;
     enum DTLSState state;
     DTLSContext *ctx = (DTLSContext*)SSL_get_ex_data(dtls, 0);
-    void *s1 = ctx->log_avcl;
 
     w = where & ~SSL_ST_MASK;
     if (w & SSL_ST_CONNECT)
@@ -217,7 +190,7 @@ static void openssl_dtls_on_info(const SSL *dtls, int where, int r0)
 
     r1 = SSL_get_error(dtls, r0);
     if (where & SSL_CB_LOOP) {
-        av_log(s1, AV_LOG_VERBOSE, "DTLS: method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
+        av_log(NULL, AV_LOG_VERBOSE, "DTLS: method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
             method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, r0, r1);
     } else if (where & SSL_CB_ALERT) {
         method = (where & SSL_CB_READ) ? "read":"write";
@@ -226,10 +199,10 @@ static void openssl_dtls_on_info(const SSL *dtls, int where, int r0)
         alert_desc = SSL_alert_desc_string(r0);
 
         if (!av_strcasecmp(alert_type, "warning") && !av_strcasecmp(alert_desc, "CN"))
-            av_log(s1, AV_LOG_WARNING, "DTLS: SSL3 alert method=%s type=%s, desc=%s(%s), where=%d, ret=%d, r1=%d\n",
+            av_log(NULL, AV_LOG_WARNING, "DTLS: SSL3 alert method=%s type=%s, desc=%s(%s), where=%d, ret=%d, r1=%d\n",
                 method, alert_type, alert_desc, SSL_alert_desc_string_long(r0), where, r0, r1);
         else
-            av_log(s1, AV_LOG_ERROR, "DTLS: SSL3 alert method=%s type=%s, desc=%s(%s), where=%d, ret=%d, r1=%d\n",
+            av_log(NULL, AV_LOG_ERROR, "DTLS: SSL3 alert method=%s type=%s, desc=%s(%s), where=%d, ret=%d, r1=%d\n",
                 method, alert_type, alert_desc, SSL_alert_desc_string_long(r0), where, r0, r1);
 
         /**
@@ -242,20 +215,20 @@ static void openssl_dtls_on_info(const SSL *dtls, int where, int r0)
         is_close_notify = !av_strncasecmp(alert_desc, "CN", 2);
         state = is_fatal ? DTLS_STATE_FAILED : (is_warning && is_close_notify ? DTLS_STATE_CLOSED : DTLS_STATE_NONE);
         if (state != DTLS_STATE_NONE && ctx->on_state) {
-            av_log(s1, AV_LOG_INFO, "DTLS: Notify ctx=%p, state=%d, fatal=%d, warning=%d, cn=%d\n",
+            av_log(NULL, AV_LOG_INFO, "DTLS: Notify ctx=%p, state=%d, fatal=%d, warning=%d, cn=%d\n",
                 ctx, state, is_fatal, is_warning, is_close_notify);
             ctx->on_state(ctx, state, alert_type, alert_desc);
         }
     } else if (where & SSL_CB_EXIT) {
         if (!r0)
-            av_log(s1, AV_LOG_WARNING, "DTLS: Fail method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
+            av_log(NULL, AV_LOG_WARNING, "DTLS: Fail method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
                 method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, r0, r1);
         else if (r0 < 0)
             if (r1 != SSL_ERROR_NONE && r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE)
-                av_log(s1, AV_LOG_ERROR, "DTLS: Error method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
+                av_log(NULL, AV_LOG_ERROR, "DTLS: Error method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
                     method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, r0, r1);
             else
-                av_log(s1, AV_LOG_VERBOSE, "DTLS: method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
+                av_log(NULL, AV_LOG_VERBOSE, "DTLS: method=%s state=%s(%s), where=%d, ret=%d, r1=%d\n",
                     method, SSL_state_string(dtls), SSL_state_string_long(dtls), where, r0, r1);
     }
 }
@@ -265,7 +238,6 @@ static void openssl_dtls_state_trace(DTLSContext *ctx, uint8_t *data, int length
     uint8_t content_type = 0;
     uint16_t size = 0;
     uint8_t handshake_type = 0;
-    void *s1 = ctx->log_avcl;
 
     /* Change_cipher_spec(20), alert(21), handshake(22), application_data(23) */
     if (length >= 1)
@@ -275,7 +247,7 @@ static void openssl_dtls_state_trace(DTLSContext *ctx, uint8_t *data, int length
     if (length >= 14)
         handshake_type = (uint8_t)data[13];
 
-    av_log(s1, AV_LOG_VERBOSE, "WHIP: DTLS state %s %s, done=%u, arq=%u, len=%u, cnt=%u, size=%u, hs=%u\n",
+    av_log(NULL, AV_LOG_VERBOSE, "WHIP: DTLS state %s %s, done=%u, arq=%u, len=%u, cnt=%u, size=%u, hs=%u\n",
         "Active", (incoming? "RECV":"SEND"), ctx->dtls_done_for_us, ctx->dtls_arq_packets, length,
         content_type, size, handshake_type);
 }
@@ -302,14 +274,13 @@ static long openssl_dtls_bio_out_callback_ex(BIO *b, int oper, const char *argp,
     uint8_t content_type, handshake_type;
     uint8_t *data = (uint8_t*)argp;
     DTLSContext* ctx = b ? (DTLSContext*)BIO_get_callback_arg(b) : NULL;
-    void *s1 = ctx ? ctx->log_avcl : NULL;
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L // v3.0.x
     req_size = len;
-    av_log(s1, AV_LOG_DEBUG, "DTLS: bio callback b=%p, oper=%d, argp=%p, len=%ld, argi=%d, argl=%ld, retvalue=%d, processed=%p, req_size=%d\n",
+    av_log(NULL, AV_LOG_DEBUG, "DTLS: bio callback b=%p, oper=%d, argp=%p, len=%ld, argi=%d, argl=%ld, retvalue=%d, processed=%p, req_size=%d\n",
         b, oper, argp, len, argi, argl, retvalue, processed, req_size);
 #else
-    av_log(s1, AV_LOG_DEBUG, "DTLS: bio callback b=%p, oper=%d, argp=%p, argi=%d, argl=%ld, retvalue=%ld, req_size=%d\n",
+    av_log(NULL, AV_LOG_DEBUG, "DTLS: bio callback b=%p, oper=%d, argp=%p, argi=%d, argl=%ld, retvalue=%ld, req_size=%d\n",
         b, oper, argp, argi, argl, retvalue, req_size);
 #endif
 
@@ -327,7 +298,7 @@ static long openssl_dtls_bio_out_callback_ex(BIO *b, int oper, const char *argp,
     ctx->dtls_last_handshake_type = handshake_type;
 
     if (ret < 0) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: Send request failed, oper=%d, content=%d, handshake=%d, size=%d, is_arq=%d\n",
+        av_log(NULL, AV_LOG_ERROR, "DTLS: Send request failed, oper=%d, content=%d, handshake=%d, size=%d, is_arq=%d\n",
             oper, content_type, handshake_type, req_size, is_arq);
         return ret;
     }
@@ -343,7 +314,6 @@ static int openssl_dtls_gen_private_key(DTLSContext *ctx)
 #else
     const char *curve = "prime256v1";
 #endif
-    void *s1 = ctx->log_avcl;
 
     /* Should use the curves in ClientHello.supported_groups, for example:
      *      Supported Group: x25519 (0x001d)
@@ -363,26 +333,26 @@ static int openssl_dtls_gen_private_key(DTLSContext *ctx)
 #endif
 
     if (EC_KEY_set_group(ctx->dtls_eckey, ecgroup) != 1) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: EC_KEY_set_group failed\n");
+        av_log(NULL, AV_LOG_ERROR, "DTLS: EC_KEY_set_group failed\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     if (EC_KEY_generate_key(ctx->dtls_eckey) != 1) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: EC_KEY_generate_key failed\n");
+        av_log(NULL, AV_LOG_ERROR, "DTLS: EC_KEY_generate_key failed\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     if (EVP_PKEY_set1_EC_KEY(ctx->dtls_pkey, ctx->dtls_eckey) != 1) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: EVP_PKEY_set1_EC_KEY failed\n");
+        av_log(NULL, AV_LOG_ERROR, "DTLS: EVP_PKEY_set1_EC_KEY failed\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 #else
     ctx->dtls_pkey = EVP_EC_gen(curve);
     if (!ctx->dtls_pkey) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: EVP_EC_gen curve=%s failed\n", curve);
+        av_log(NULL, AV_LOG_ERROR, "DTLS: EVP_EC_gen curve=%s failed\n", curve);
         ret = AVERROR(EINVAL);
         goto end;
     }
@@ -403,7 +373,6 @@ static int openssl_dtls_gen_certificate(DTLSContext *ctx)
     const char *aor = "ffmpeg.org";
     X509_NAME* subject = NULL;
     X509 *dtls_cert = NULL;
-    void *s1 = ctx->log_avcl;
 
     /* To prevent a crash during cleanup, always initialize it. */
     av_bprint_init(&fingerprint, 1, MAX_URL_SIZE);
@@ -422,61 +391,61 @@ static int openssl_dtls_gen_certificate(DTLSContext *ctx)
 
     serial = (int)av_get_random_seed();
     if (ASN1_INTEGER_set(X509_get_serialNumber(dtls_cert), serial) != 1) {
-        av_log(s1, AV_LOG_ERROR, "WHIP: Failed to set serial\n");
+        av_log(NULL, AV_LOG_ERROR, "WHIP: Failed to set serial\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     if (X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC, aor, strlen(aor), -1, 0) != 1) {
-        av_log(s1, AV_LOG_ERROR, "WHIP: Failed to set CN\n");
+        av_log(NULL, AV_LOG_ERROR, "WHIP: Failed to set CN\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     if (X509_set_issuer_name(dtls_cert, subject) != 1) {
-        av_log(s1, AV_LOG_ERROR, "WHIP: Failed to set issuer\n");
+        av_log(NULL, AV_LOG_ERROR, "WHIP: Failed to set issuer\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
     if (X509_set_subject_name(dtls_cert, subject) != 1) {
-        av_log(s1, AV_LOG_ERROR, "WHIP: Failed to set subject name\n");
+        av_log(NULL, AV_LOG_ERROR, "WHIP: Failed to set subject name\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     expire_day = 365;
     if (!X509_gmtime_adj(X509_get_notBefore(dtls_cert), 0)) {
-        av_log(s1, AV_LOG_ERROR, "WHIP: Failed to set notBefore\n");
+        av_log(NULL, AV_LOG_ERROR, "WHIP: Failed to set notBefore\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
     if (!X509_gmtime_adj(X509_get_notAfter(dtls_cert), 60*60*24*expire_day)) {
-        av_log(s1, AV_LOG_ERROR, "WHIP: Failed to set notAfter\n");
+        av_log(NULL, AV_LOG_ERROR, "WHIP: Failed to set notAfter\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     if (X509_set_version(dtls_cert, 2) != 1) {
-        av_log(s1, AV_LOG_ERROR, "WHIP: Failed to set version\n");
+        av_log(NULL, AV_LOG_ERROR, "WHIP: Failed to set version\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     if (X509_set_pubkey(dtls_cert, ctx->dtls_pkey) != 1) {
-        av_log(s1, AV_LOG_ERROR, "WHIP: Failed to set public key\n");
+        av_log(NULL, AV_LOG_ERROR, "WHIP: Failed to set public key\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     if (!X509_sign(dtls_cert, ctx->dtls_pkey, EVP_sha1())) {
-        av_log(s1, AV_LOG_ERROR, "WHIP: Failed to sign certificate\n");
+        av_log(NULL, AV_LOG_ERROR, "WHIP: Failed to sign certificate\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     /* Generate the fingerpint of certficate. */
     if (X509_digest(dtls_cert, EVP_sha256(), md, &n) != 1) {
-        av_log(s1, AV_LOG_ERROR, "Failed to generate fingerprint\n");
+        av_log(NULL, AV_LOG_ERROR, "Failed to generate fingerprint\n");
         ret = AVERROR(EIO);
         goto end;
     }
@@ -486,12 +455,12 @@ static int openssl_dtls_gen_certificate(DTLSContext *ctx)
             av_bprintf(&fingerprint, ":");
     }
     if (!av_bprint_is_complete(&fingerprint)) {
-        av_log(s1, AV_LOG_ERROR, "Fingerprint %d exceed max %d, %s\n", ret, MAX_URL_SIZE, fingerprint.str);
+        av_log(NULL, AV_LOG_ERROR, "Fingerprint %d exceed max %d, %s\n", ret, MAX_URL_SIZE, fingerprint.str);
         ret = AVERROR(EIO);
         goto end;
     }
     if (!fingerprint.str || !strlen(fingerprint.str)) {
-        av_log(s1, AV_LOG_ERROR, "Fingerprint is empty\n");
+        av_log(NULL, AV_LOG_ERROR, "Fingerprint is empty\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
@@ -514,7 +483,6 @@ end:
 static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
 {
     int ret = 0;
-    void *s1 = ctx->log_avcl;
     EVP_PKEY *dtls_pkey = ctx->dtls_pkey;
     X509 *dtls_cert = ctx->dtls_cert;
     SSL_CTX *dtls_ctx = NULL;
@@ -533,7 +501,7 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
 #if OPENSSL_VERSION_NUMBER >= 0x10002000L /* OpenSSL 1.0.2 */
     /* For ECDSA, we could set the curves list. */
     if (SSL_CTX_set1_curves_list(dtls_ctx, "P-521:P-384:P-256") != 1) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: SSL_CTX_set1_curves_list failed\n");
+        av_log(NULL, AV_LOG_ERROR, "DTLS: SSL_CTX_set1_curves_list failed\n");
         return AVERROR(EINVAL);
     }
 #endif
@@ -547,23 +515,20 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
 #endif
 
     /**
-     * We use "ALL", while you can use "DEFAULT" means "ALL:!EXPORT:!LOW:!aNULL:!eNULL:!SSLv2"
-     *      Cipher Suite: ECDHE-ECDSA-AES128-CBC-SHA (0xc009)
-     *      Cipher Suite: ECDHE-RSA-AES128-CBC-SHA (0xc013)
-     *      Cipher Suite: ECDHE-ECDSA-AES256-CBC-SHA (0xc00a)
-     *      Cipher Suite: ECDHE-RSA-AES256-CBC-SHA (0xc014)
+     * We activate "ALL" cipher suites to align with the peer's capabilities,
+     * ensuring maximum compatibility.
      */
     if (SSL_CTX_set_cipher_list(dtls_ctx, "ALL") != 1) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: SSL_CTX_set_cipher_list failed\n");
+        av_log(NULL, AV_LOG_ERROR, "DTLS: SSL_CTX_set_cipher_list failed\n");
         return AVERROR(EINVAL);
     }
     /* Setup the certificate. */
     if (SSL_CTX_use_certificate(dtls_ctx, dtls_cert) != 1) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: SSL_CTX_use_certificate failed\n");
+        av_log(NULL, AV_LOG_ERROR, "DTLS: SSL_CTX_use_certificate failed\n");
         return AVERROR(EINVAL);
     }
     if (SSL_CTX_use_PrivateKey(dtls_ctx, dtls_pkey) != 1) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: SSL_CTX_use_PrivateKey failed\n");
+        av_log(NULL, AV_LOG_ERROR, "DTLS: SSL_CTX_use_PrivateKey failed\n");
         return AVERROR(EINVAL);
     }
 
@@ -576,7 +541,7 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
     SSL_CTX_set_read_ahead(dtls_ctx, 1);
     /* Only support SRTP_AES128_CM_SHA1_80, please read ssl/d1_srtp.c */
     if (SSL_CTX_set_tlsext_use_srtp(dtls_ctx, "SRTP_AES128_CM_SHA1_80")) {
-        av_log(s1, AV_LOG_ERROR, "DTLS: SSL_CTX_set_tlsext_use_srtp failed\n");
+        av_log(NULL, AV_LOG_ERROR, "DTLS: SSL_CTX_set_tlsext_use_srtp failed\n");
         return AVERROR(EINVAL);
     }
 
@@ -644,29 +609,28 @@ static av_cold int openssl_dtls_init_context(DTLSContext *ctx)
 static av_cold int dtls_context_init(DTLSContext *ctx)
 {
     int ret = 0;
-    void *s1 = ctx->log_avcl;
 
     ctx->dtls_init_starttime = av_gettime();
 
     /* Generate a private key to ctx->dtls_pkey. */
     if ((ret = openssl_dtls_gen_private_key(ctx)) < 0) {
-        av_log(s1, AV_LOG_ERROR, "Failed to generate DTLS private key\n");
+        av_log(NULL, AV_LOG_ERROR, "Failed to generate DTLS private key\n");
         return ret;
     }
 
     /* Generate a self-signed certificate. */
     if ((ret = openssl_dtls_gen_certificate(ctx)) < 0) {
-        av_log(s1, AV_LOG_ERROR, "Failed to generate DTLS certificate\n");
+        av_log(NULL, AV_LOG_ERROR, "Failed to generate DTLS certificate\n");
         return ret;
     }
 
     if ((ret = openssl_dtls_init_context(ctx)) < 0) {
-        av_log(s1, AV_LOG_ERROR, "Failed to initialize DTLS context\n");
+        av_log(NULL, AV_LOG_ERROR, "Failed to initialize DTLS context\n");
         return ret;
     }
 
     ctx->dtls_init_endtime = av_gettime();
-    av_log(s1, AV_LOG_INFO, "DTLS: Setup ok, MTU=%d, cost=%dms, fingerprint %s\n",
+    av_log(NULL, AV_LOG_INFO, "DTLS: Setup ok, MTU=%d, cost=%dms, fingerprint %s\n",
         ctx->mtu, ELAPSED(ctx->dtls_init_starttime, av_gettime()), ctx->dtls_fingerprint);
 
     return ret;
@@ -680,7 +644,6 @@ static int dtls_context_start(DTLSContext *ctx)
 {
     int ret = 0, r0, r1;
     SSL *dtls = ctx->dtls;
-    void *s1 = ctx->log_avcl;
     char detail_error[256];
 
     ctx->dtls_handshake_starttime = av_gettime();
@@ -704,7 +667,7 @@ static int dtls_context_start(DTLSContext *ctx)
     ERR_clear_error();
     // Fatal SSL error, for example, no available suite when peer is DTLS 1.0 while we are DTLS 1.2.
     if (r0 < 0 && (r1 != SSL_ERROR_NONE && r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE)) {
-        av_log(s1, AV_LOG_ERROR, "Failed to drive SSL context, r0=%d, r1=%d %s\n", r0, r1, detail_error);
+        av_log(NULL, AV_LOG_ERROR, "Failed to drive SSL context, r0=%d, r1=%d %s\n", r0, r1, detail_error);
         return AVERROR(EIO);
     }
 
@@ -726,7 +689,6 @@ static int dtls_context_write(DTLSContext *ctx, char* buf, int size)
     SSL *dtls = ctx->dtls;
     const char* dst = "EXTRACTOR-dtls_srtp";
     BIO *bio_in = ctx->bio_in;
-    void *s1 = ctx->log_avcl;
     char detail_error[256];
 
     /* Got DTLS response successfully. */
@@ -734,7 +696,7 @@ static int dtls_context_write(DTLSContext *ctx, char* buf, int size)
     if ((r0 = BIO_write(bio_in, buf, size)) <= 0) {
         res_ct = size > 0 ? buf[0]: 0;
         res_ht = size > 13 ? buf[13] : 0;
-        av_log(s1, AV_LOG_ERROR, "DTLS: Feed response failed, content=%d, handshake=%d, size=%d, r0=%d\n",
+        av_log(NULL, AV_LOG_ERROR, "DTLS: Feed response failed, content=%d, handshake=%d, size=%d, r0=%d\n",
             res_ct, res_ht, size, r0);
         ret = AVERROR(EIO);
         goto end;
@@ -751,12 +713,12 @@ static int dtls_context_write(DTLSContext *ctx, char* buf, int size)
     ERR_clear_error();
     if (r0 <= 0) {
         if (r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE && r1 != SSL_ERROR_ZERO_RETURN) {
-            av_log(s1, AV_LOG_ERROR, "DTLS: Read failed, r0=%d, r1=%d %s\n", r0, r1, detail_error);
+            av_log(NULL, AV_LOG_ERROR, "DTLS: Read failed, r0=%d, r1=%d %s\n", r0, r1, detail_error);
             ret = AVERROR(EIO);
             goto end;
         }
     } else {
-        av_log(s1, AV_LOG_TRACE, "DTLS: Read %d bytes, r0=%d, r1=%d\n", r0, r0, r1);
+        av_log(NULL, AV_LOG_TRACE, "DTLS: Read %d bytes, r0=%d, r1=%d\n", r0, r0, r1);
     }
 
     /* Check whether the DTLS is completed. */
@@ -769,10 +731,10 @@ static int dtls_context_write(DTLSContext *ctx, char* buf, int size)
 
     /* Export SRTP master key after DTLS done */
     if (!ctx->dtls_srtp_key_exported) {
-        ret = SSL_export_keying_material(dtls, ctx->dtls_srtp_material, sizeof(ctx->dtls_srtp_material),
+        ret = SSL_export_keying_material(dtls, ctx->dtls_srtp_materials, sizeof(ctx->dtls_srtp_materials),
             dst, strlen(dst), NULL, 0, 0);
         if (!ret) {
-            av_log(s1, AV_LOG_ERROR, "DTLS: SSL export key r0=%lu, ret=%d\n", ERR_get_error(), ret);
+            av_log(NULL, AV_LOG_ERROR, "DTLS: SSL export key r0=%lu, ret=%d\n", ERR_get_error(), ret);
             ret = AVERROR(EIO);
             goto end;
         }
@@ -928,8 +890,6 @@ typedef struct RTCContext {
     char* authorization;
 } RTCContext;
 
-static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size);
-
 /**
  * When DTLS state change.
  */
@@ -958,7 +918,7 @@ static int dtls_context_on_state(DTLSContext *ctx, enum DTLSState state, const c
         rtc->state = RTC_STATE_DTLS_FINISHED;
         rtc->rtc_dtls_time = av_gettime();
         av_log(s, AV_LOG_INFO, "WHIP: DTLS handshake, done=%d, exported=%d, arq=%d, srtp_material=%luB, cost=%dms, elapsed=%dms\n",
-            ctx->dtls_done_for_us, ctx->dtls_srtp_key_exported, ctx->dtls_arq_packets, sizeof(ctx->dtls_srtp_material),
+            ctx->dtls_done_for_us, ctx->dtls_srtp_key_exported, ctx->dtls_arq_packets, sizeof(ctx->dtls_srtp_materials),
             ELAPSED(ctx->dtls_handshake_starttime, ctx->dtls_handshake_endtime),
             ELAPSED(rtc->rtc_starttime, av_gettime()));
         return ret;
@@ -994,7 +954,6 @@ static av_cold int whip_init(AVFormatContext *s)
     rtc->rtc_starttime = av_gettime();
 
     /* Use the same logging context as AV format. */
-    rtc->dtls_ctx.log_avcl = s;
     rtc->dtls_ctx.mtu = rtc->pkt_size;
     rtc->dtls_ctx.opaque = s;
     rtc->dtls_ctx.on_state = dtls_context_on_state;
@@ -1910,18 +1869,30 @@ end:
 static int setup_srtp(AVFormatContext *s)
 {
     int ret;
-    char recv_key[DTLS_SRTP_MASTER_KEY_LEN], send_key[DTLS_SRTP_MASTER_KEY_LEN];
-    char buf[AV_BASE64_SIZE(DTLS_SRTP_MASTER_KEY_LEN)];
+    char recv_key[DTLS_SRTP_KEY_LEN + DTLS_SRTP_SALT_LEN];
+    char send_key[DTLS_SRTP_KEY_LEN + DTLS_SRTP_SALT_LEN];
+    char buf[AV_BASE64_SIZE(DTLS_SRTP_KEY_LEN + DTLS_SRTP_SALT_LEN)];
     const char* suite = "AES_CM_128_HMAC_SHA1_80";
     RTCContext *rtc = s->priv_data;
 
+    /**
+     * This represents the material used to build the SRTP master key. It is
+     * generated by DTLS and has the following layout:
+     *          16B         16B         14B             14B
+     *      client_key | server_key | client_salt | server_salt
+     */
+    char *client_key = rtc->dtls_ctx.dtls_srtp_materials;
+    char *server_key = rtc->dtls_ctx.dtls_srtp_materials + DTLS_SRTP_KEY_LEN;
+    char *client_salt = server_key + DTLS_SRTP_KEY_LEN;
+    char *server_salt = client_salt + DTLS_SRTP_SALT_LEN;
+
     /* As DTLS server, the recv key is client master key plus salt. */
-    memcpy(recv_key, rtc->dtls_ctx.dtls_srtp_material, 16);
-    memcpy(recv_key + 16, rtc->dtls_ctx.dtls_srtp_material + 32, 14);
+    memcpy(recv_key, client_key, DTLS_SRTP_KEY_LEN);
+    memcpy(recv_key + DTLS_SRTP_KEY_LEN, client_salt, DTLS_SRTP_SALT_LEN);
 
     /* As DTLS server, the send key is server master key plus salt. */
-    memcpy(send_key, rtc->dtls_ctx.dtls_srtp_material + 16, 16);
-    memcpy(send_key + 16, rtc->dtls_ctx.dtls_srtp_material + 46, 14);
+    memcpy(send_key, server_key, DTLS_SRTP_KEY_LEN);
+    memcpy(send_key + DTLS_SRTP_KEY_LEN, server_salt, DTLS_SRTP_SALT_LEN);
 
     /* Setup SRTP context for outgoing packets */
     if (!av_base64_encode(buf, sizeof(buf), send_key, sizeof(send_key))) {
@@ -1970,6 +1941,8 @@ static int setup_srtp(AVFormatContext *s)
 end:
     return ret;
 }
+
+static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size);
 
 /**
  * Creates dedicated RTP muxers for each stream in the AVFormatContext to build RTP
@@ -2115,6 +2088,7 @@ static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size)
      * For video, the STAP-A with SPS/PPS should:
      * 1. The marker bit should be 0, never be 1.
      * 2. The NRI should equal to the first NALU's.
+     * TODO: FIXME: Should fix it in rtpenc.c
      */
     if (is_video && buf_size > 12) {
         nalu_header = buf[12] & 0x1f;
