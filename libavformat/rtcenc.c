@@ -44,6 +44,7 @@
  * be it an offer or answer.
  */
 #define MAX_SDP_SIZE 8192
+
 /**
  * Maximum size of the buffer for sending and receiving UDP packets.
  * Please note that this size does not limit the size of the UDP packet that can be sent.
@@ -61,6 +62,7 @@
  */
 #define DTLS_SRTP_KEY_LEN 16
 #define DTLS_SRTP_SALT_LEN 14
+
 /**
  * The maximum size of the Secure Real-time Transport Protocol (SRTP) HMAC checksum
  * and padding that is appended to the end of the packet. To calculate the maximum
@@ -68,6 +70,7 @@
  * this size from the `pkt_size`.
  */
 #define DTLS_SRTP_CHECKSUM_LEN 16
+
 /**
  * STAP-A stands for Single-Time Aggregation Packet.
  * The NALU type for STAP-A is 24 (0x18).
@@ -178,8 +181,36 @@ typedef struct DTLSContext {
     int mtu;
 } DTLSContext;
 
-static int is_dtls_packet(char *buf, int buf_size) {
-    return buf_size > 13 && buf[0] > 19 && buf[0] < 64;
+/**
+ * The DTLS content type.
+ * See https://tools.ietf.org/html/rfc2246#section-6.2.1
+ * change_cipher_spec(20), alert(21), handshake(22), application_data(23)
+ */
+#define DTLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC 20
+
+/**
+ * The DTLS record layer header has a total size of 13 bytes, consisting of
+ * ContentType (1 byte), ProtocolVersion (2 bytes), Epoch (2 bytes),
+ * SequenceNumber (6 bytes), and Length (2 bytes).
+ * See https://datatracker.ietf.org/doc/html/rfc9147#section-4
+ */
+#define DTLS_RECORD_LAYER_HEADER_LEN 13
+
+/**
+ * The DTLS version number, which is 0xfeff for DTLS 1.0, or 0xfefd for DTLS 1.2.
+ * See https://datatracker.ietf.org/doc/html/rfc9147#name-the-dtls-record-layer
+ */
+#define DTLS_VERSION_10 0xfeff
+#define DTLS_VERSION_12 0xfefd
+
+/**
+ * Whether the packet is a DTLS packet.
+ */
+static int is_dtls_packet(char *b, int size) {
+    uint16_t version = AV_RB16(&b[1]);
+    return size > DTLS_RECORD_LAYER_HEADER_LEN &&
+        b[0] >= DTLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC &&
+        (version == DTLS_VERSION_10 || version == DTLS_VERSION_12);
 }
 
 /**
