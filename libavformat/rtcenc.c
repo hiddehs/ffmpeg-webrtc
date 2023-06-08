@@ -1694,7 +1694,8 @@ end:
  * @param response_size Pointer to an integer that will store the size of the generated response.
  * @return Returns 0 if successful or AVERROR_xxx if an error occurs.
  */
-static int ice_create_response(AVFormatContext *s, char *tid, int tid_size, uint8_t *buf, int buf_size, int *response_size) {
+static int ice_create_response(AVFormatContext *s, char *tid, int tid_size, uint8_t *buf, int buf_size, int *response_size)
+{
     int ret = 0, size, crc32;
     AVIOContext *pb = NULL;
     AVHMAC *hmac = NULL;
@@ -1752,19 +1753,39 @@ end:
     return ret;
 }
 
-static int ice_is_binding_request(char *buf, int buf_size) {
-    return buf_size > 1 && buf[0] == 0x00 && buf[1] == 0x01;
+/**
+ * The STUN message header, which is 20 bytes long, comprises the
+ * STUNMessageType (1B), MessageLength (2B), MagicCookie (4B),
+ * and TransactionID (12B).
+ * See https://datatracker.ietf.org/doc/html/rfc5389#section-6
+ */
+#define ICE_STUN_HEADER_SIZE 20
+
+/**
+ * A Binding request has class=0b00 (request) and method=0b000000000001 (Binding)
+ * and is encoded into the first 16 bits as 0x0001.
+ * See https://datatracker.ietf.org/doc/html/rfc5389#section-6
+ */
+static int ice_is_binding_request(char *b, int size)
+{
+    return size >= ICE_STUN_HEADER_SIZE && AV_RB16(&b[0]) == 0x0001;
 }
 
-static int ice_is_binding_response(char *buf, int buf_size) {
-    return buf_size > 1 && buf[0] == 0x01 && buf[1] == 0x01;
+/**
+ * A Binding response has class=0b10 (success response) and method=0b000000000001,
+ * and is encoded into the first 16 bits as 0x0101.
+ */
+static int ice_is_binding_response(char *b, int size)
+{
+    return size >= ICE_STUN_HEADER_SIZE && AV_RB16(&b[0]) == 0x0101;
 }
 
 /**
  * This function handles incoming binding request messages by responding to them.
  * If the message is not a binding request, it will be ignored.
  */
-static int ice_handle_binding_request(AVFormatContext *s, char *buf, int buf_size) {
+static int ice_handle_binding_request(AVFormatContext *s, char *buf, int buf_size)
+{
     int ret = 0, size;
     char tid[12];
     RTCContext *rtc = s->priv_data;
@@ -1773,8 +1794,9 @@ static int ice_handle_binding_request(AVFormatContext *s, char *buf, int buf_siz
     if (!ice_is_binding_request(buf, buf_size))
         return ret;
 
-    if (buf_size < 20) {
-        av_log(rtc, AV_LOG_ERROR, "WHIP: Invalid STUN message size. Expected at least 20, got %d\n", buf_size);
+    if (buf_size < ICE_STUN_HEADER_SIZE) {
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Invalid STUN message, expected at least %d, got %d\n",
+            ICE_STUN_HEADER_SIZE, buf_size);
         return AVERROR(EINVAL);
     }
 
