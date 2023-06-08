@@ -2047,7 +2047,69 @@ end:
     return ret;
 }
 
-static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size);
+/**
+ * Callback triggered by the RTP muxer when it creates and sends out an RTP packet.
+ *
+ * This function modifies the video STAP packet, removing the markers, and updating the
+ * NRI of the first NALU. Additionally, it uses the corresponding SRTP context to encrypt
+ * the RTP packet, where the video packet is handled by the video SRTP context.
+ */
+static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size)
+{
+    int ret, cipher_size, is_rtcp, is_video;
+    uint8_t payload_type, nalu_header;
+    AVFormatContext *s = opaque;
+    RTCContext *rtc = s->priv_data;
+    SRTPContext *srtp;
+
+    /* Ignore if not RTP or RTCP packet. */
+    if (buf_size < 12 || (buf[0] & 0xC0) != 0x80)
+        return 0;
+
+    /* Only support audio, video and rtcp. */
+    is_rtcp = buf[1] >= 192 && buf[1] <= 223;
+    payload_type = buf[1] & 0x7f;
+    is_video = payload_type == rtc->video_payload_type;
+    if (!is_rtcp && payload_type != rtc->video_payload_type && payload_type != rtc->audio_payload_type)
+        return 0;
+
+    /**
+     * For video, the STAP-A with SPS/PPS should:
+     * 1. The marker bit should be 0, never be 1.
+     * 2. The NRI should equal to the first NALU's.
+     * TODO: FIXME: Should fix it in rtpenc.c
+     */
+    if (is_video && buf_size > 12) {
+        nalu_header = buf[12] & 0x1f;
+        if (nalu_header == NALU_TYPE_STAP_A) {
+            /* Reset the marker bit to 0. */
+            if (buf[1] & 0x80)
+                buf[1] &= 0x7f;
+
+            /* Reset the NRI to the first NALU's NRI. */
+            if (buf_size > 15 && (buf[15]&0x60) != (buf[12]&0x60))
+                buf[12] = (buf[12]&0x80) | (buf[15]&0x60) | (buf[12]&0x1f);
+        }
+    }
+
+    /* Get the corresponding SRTP context. */
+    srtp = is_rtcp ? &rtc->srtp_rtcp_send : (is_video? &rtc->srtp_video_send : &rtc->srtp_audio_send);
+
+    /* Encrypt by SRTP and send out. */
+    cipher_size = ff_srtp_encrypt(srtp, buf, buf_size, rtc->buf, sizeof(rtc->buf));
+    if (cipher_size <= 0 || cipher_size < buf_size) {
+        av_log(rtc, AV_LOG_WARNING, "WHIP: Failed to encrypt packet=%dB, cipher=%dB\n", buf_size, cipher_size);
+        return 0;
+    }
+
+    ret = ffurl_write(rtc->udp_uc, rtc->buf, cipher_size);
+    if (ret < 0) {
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to write packet=%dB, ret=%d\n", cipher_size, ret);
+        return ret;
+    }
+
+    return ret;
+}
 
 /**
  * Creates dedicated RTP muxers for each stream in the AVFormatContext to build RTP
@@ -2159,70 +2221,6 @@ end:
         avio_context_free(&rtp_ctx->pb);
     avformat_free_context(rtp_ctx);
     av_dict_free(&opts);
-    return ret;
-}
-
-/**
- * Callback triggered by the RTP muxer when it creates and sends out an RTP packet.
- *
- * This function modifies the video STAP packet, removing the markers, and updating the
- * NRI of the first NALU. Additionally, it uses the corresponding SRTP context to encrypt
- * the RTP packet, where the video packet is handled by the video SRTP context.
- */
-static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size)
-{
-    int ret, cipher_size, is_rtcp, is_video;
-    uint8_t payload_type, nalu_header;
-    AVFormatContext *s = opaque;
-    RTCContext *rtc = s->priv_data;
-    SRTPContext *srtp;
-
-    /* Ignore if not RTP or RTCP packet. */
-    if (buf_size < 12 || (buf[0] & 0xC0) != 0x80)
-        return 0;
-
-    /* Only support audio, video and rtcp. */
-    is_rtcp = buf[1] >= 192 && buf[1] <= 223;
-    payload_type = buf[1] & 0x7f;
-    is_video = payload_type == rtc->video_payload_type;
-    if (!is_rtcp && payload_type != rtc->video_payload_type && payload_type != rtc->audio_payload_type)
-        return 0;
-
-    /**
-     * For video, the STAP-A with SPS/PPS should:
-     * 1. The marker bit should be 0, never be 1.
-     * 2. The NRI should equal to the first NALU's.
-     * TODO: FIXME: Should fix it in rtpenc.c
-     */
-    if (is_video && buf_size > 12) {
-        nalu_header = buf[12] & 0x1f;
-        if (nalu_header == NALU_TYPE_STAP_A) {
-            /* Reset the marker bit to 0. */
-            if (buf[1] & 0x80)
-                buf[1] &= 0x7f;
-
-            /* Reset the NRI to the first NALU's NRI. */
-            if (buf_size > 15 && (buf[15]&0x60) != (buf[12]&0x60))
-                buf[12] = (buf[12]&0x80) | (buf[15]&0x60) | (buf[12]&0x1f);
-        }
-    }
-
-    /* Get the corresponding SRTP context. */
-    srtp = is_rtcp ? &rtc->srtp_rtcp_send : (is_video? &rtc->srtp_video_send : &rtc->srtp_audio_send);
-
-    /* Encrypt by SRTP and send out. */
-    cipher_size = ff_srtp_encrypt(srtp, buf, buf_size, rtc->buf, sizeof(rtc->buf));
-    if (cipher_size <= 0 || cipher_size < buf_size) {
-        av_log(rtc, AV_LOG_WARNING, "WHIP: Failed to encrypt packet=%dB, cipher=%dB\n", buf_size, cipher_size);
-        return 0;
-    }
-
-    ret = ffurl_write(rtc->udp_uc, rtc->buf, cipher_size);
-    if (ret < 0) {
-        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to write packet=%dB, ret=%d\n", cipher_size, ret);
-        return ret;
-    }
-
     return ret;
 }
 
