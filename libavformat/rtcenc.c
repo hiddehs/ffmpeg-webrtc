@@ -27,6 +27,7 @@
 #include "libavutil/bprint.h"
 #include "libavutil/crc.h"
 #include "libavutil/hmac.h"
+#include "libavutil/intreadwrite.h"
 #include "libavutil/opt.h"
 #include "libavutil/random_seed.h"
 #include "libavutil/time.h"
@@ -288,11 +289,11 @@ static void openssl_dtls_state_trace(DTLSContext *ctx, uint8_t *data, int length
 
     /* Change_cipher_spec(20), alert(21), handshake(22), application_data(23) */
     if (length >= 1)
-        content_type = (uint8_t)data[0];
+        content_type = AV_RB8(&data[0]);
     if (length >= 13)
-        size = (uint16_t)(data[11])<<8 | (uint16_t)data[12];
+        size = AV_RB16(&data[11]);
     if (length >= 14)
-        handshake_type = (uint8_t)data[13];
+        handshake_type = AV_RB8(&data[13]);
 
     av_log(ctx, AV_LOG_VERBOSE, "DTLS: Trace %s, done=%u, arq=%u, len=%u, cnt=%u, size=%u, hs=%u\n",
         (incoming? "RECV":"SEND"), ctx->dtls_done_for_us, ctx->dtls_arq_packets, length,
@@ -336,8 +337,8 @@ static long openssl_dtls_bio_out_callback_ex(BIO *b, int oper, const char *argp,
 
     openssl_dtls_state_trace(ctx, data, req_size, 0);
     ret = ctx->on_write ? ctx->on_write(ctx, data, req_size) : 0;
-    content_type = req_size > 0 ? data[0] : 0;
-    handshake_type = req_size > 13 ? data[13] : 0;
+    content_type = req_size > 0 ? AV_RB8(&data[0]) : 0;
+    handshake_type = req_size > 13 ? AV_RB8(&data[13]) : 0;
 
     is_arq = ctx->dtls_last_content_type == content_type && ctx->dtls_last_handshake_type == handshake_type;
     ctx->dtls_arq_packets += is_arq;
