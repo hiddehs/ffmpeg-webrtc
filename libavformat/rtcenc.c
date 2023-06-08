@@ -91,6 +91,60 @@
 /* The magic cookie for Session Traversal Utilities for NAT (STUN) messages. */
 #define STUN_MAGIC_COOKIE 0x2112A442
 
+/**
+ * The DTLS content type.
+ * See https://tools.ietf.org/html/rfc2246#section-6.2.1
+ * change_cipher_spec(20), alert(21), handshake(22), application_data(23)
+ */
+#define DTLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC 20
+
+/**
+ * The DTLS record layer header has a total size of 13 bytes, consisting of
+ * ContentType (1 byte), ProtocolVersion (2 bytes), Epoch (2 bytes),
+ * SequenceNumber (6 bytes), and Length (2 bytes).
+ * See https://datatracker.ietf.org/doc/html/rfc9147#section-4
+ */
+#define DTLS_RECORD_LAYER_HEADER_LEN 13
+
+/**
+ * The DTLS version number, which is 0xfeff for DTLS 1.0, or 0xfefd for DTLS 1.2.
+ * See https://datatracker.ietf.org/doc/html/rfc9147#name-the-dtls-record-layer
+ */
+#define DTLS_VERSION_10 0xfeff
+#define DTLS_VERSION_12 0xfefd
+
+/* Referring to Chrome's definition of RTP payload types. */
+#define RTC_RTP_PAYLOAD_TYPE_H264 106
+#define RTC_RTP_PAYLOAD_TYPE_OPUS 111
+
+/**
+ * The STUN message header, which is 20 bytes long, comprises the
+ * STUNMessageType (1B), MessageLength (2B), MagicCookie (4B),
+ * and TransactionID (12B).
+ * See https://datatracker.ietf.org/doc/html/rfc5389#section-6
+ */
+#define ICE_STUN_HEADER_SIZE 20
+
+/**
+ * The RTP header is 12 bytes long, comprising the Version(1B), PT(1B),
+ * SequenceNumber(2B), Timestamp(4B), and SSRC(4B).
+ * See https://www.rfc-editor.org/rfc/rfc3550#section-5.1
+ */
+#define RTC_RTP_HEADER_SIZE 12
+
+/**
+ * For RTCP, PT is [128, 223] (or without marker [0, 95]). Literally, RTCP starts
+ * from 64 not 0, so PT is [192, 223] (or without marker [64, 95]), see "RTCP Control
+ * Packet Types (PT)" at
+ * https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-4
+ *
+ * For RTP, the PT is [96, 127], or [224, 255] with marker. See "RTP Payload Types (PT)
+ * for standard audio and video encodings" at
+ * https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-1
+ */
+#define RTC_RTCP_PT_START 192
+#define RTC_RTCP_PT_END   223
+
 /* Calculate the elapsed time from starttime to endtime in milliseconds. */
 #define ELAPSED(starttime, endtime) ((int)(endtime - starttime) / 1000)
 
@@ -182,31 +236,9 @@ typedef struct DTLSContext {
 } DTLSContext;
 
 /**
- * The DTLS content type.
- * See https://tools.ietf.org/html/rfc2246#section-6.2.1
- * change_cipher_spec(20), alert(21), handshake(22), application_data(23)
- */
-#define DTLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC 20
-
-/**
- * The DTLS record layer header has a total size of 13 bytes, consisting of
- * ContentType (1 byte), ProtocolVersion (2 bytes), Epoch (2 bytes),
- * SequenceNumber (6 bytes), and Length (2 bytes).
- * See https://datatracker.ietf.org/doc/html/rfc9147#section-4
- */
-#define DTLS_RECORD_LAYER_HEADER_LEN 13
-
-/**
- * The DTLS version number, which is 0xfeff for DTLS 1.0, or 0xfefd for DTLS 1.2.
- * See https://datatracker.ietf.org/doc/html/rfc9147#name-the-dtls-record-layer
- */
-#define DTLS_VERSION_10 0xfeff
-#define DTLS_VERSION_12 0xfefd
-
-/**
  * Whether the packet is a DTLS packet.
  */
-static int is_dtls_packet(char *b, int size) {
+static int is_dtls_packet(uint8_t *b, int size) {
     uint16_t version = AV_RB16(&b[1]);
     return size > DTLS_RECORD_LAYER_HEADER_LEN &&
         b[0] >= DTLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC &&
@@ -1260,10 +1292,6 @@ static int parse_codec(AVFormatContext *s)
     return 0;
 }
 
-/* Referring to Chrome's definition of RTP payload types. */
-#define RTC_RTP_PAYLOAD_TYPE_H264 106
-#define RTC_RTP_PAYLOAD_TYPE_OPUS 111
-
 /**
  * Generate SDP offer according to the codec parameters, DTLS and ICE information.
  *
@@ -1758,19 +1786,11 @@ end:
 }
 
 /**
- * The STUN message header, which is 20 bytes long, comprises the
- * STUNMessageType (1B), MessageLength (2B), MagicCookie (4B),
- * and TransactionID (12B).
- * See https://datatracker.ietf.org/doc/html/rfc5389#section-6
- */
-#define ICE_STUN_HEADER_SIZE 20
-
-/**
  * A Binding request has class=0b00 (request) and method=0b000000000001 (Binding)
  * and is encoded into the first 16 bits as 0x0001.
  * See https://datatracker.ietf.org/doc/html/rfc5389#section-6
  */
-static int ice_is_binding_request(char *b, int size)
+static int ice_is_binding_request(uint8_t *b, int size)
 {
     return size >= ICE_STUN_HEADER_SIZE && AV_RB16(&b[0]) == 0x0001;
 }
@@ -1779,9 +1799,27 @@ static int ice_is_binding_request(char *b, int size)
  * A Binding response has class=0b10 (success response) and method=0b000000000001,
  * and is encoded into the first 16 bits as 0x0101.
  */
-static int ice_is_binding_response(char *b, int size)
+static int ice_is_binding_response(uint8_t *b, int size)
 {
     return size >= ICE_STUN_HEADER_SIZE && AV_RB16(&b[0]) == 0x0101;
+}
+
+/**
+ * In RTP packets, the first byte is represented as 0b10xxxxxx, where the initial
+ * two bits (0b10) indicate the RTP version,
+ * see https://www.rfc-editor.org/rfc/rfc3550#section-5.1
+ * The RTCP packet header is similar to RTP,
+ * see https://www.rfc-editor.org/rfc/rfc3550#section-6.4.1
+ */
+static int rtc_is_rtp_rtcp(uint8_t *b, int size)
+{
+    return size >= RTC_RTP_HEADER_SIZE && (b[0] & 0xC0) == 0x80;
+}
+
+/* Whether the packet is RTCP. */
+static int rtc_is_rtcp(uint8_t *b, int size)
+{
+    return size >= RTC_RTP_HEADER_SIZE && b[1] >= RTC_RTCP_PT_START && b[1] <= RTC_RTCP_PT_END;
 }
 
 /**
@@ -2067,11 +2105,11 @@ static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size)
     SRTPContext *srtp;
 
     /* Ignore if not RTP or RTCP packet. */
-    if (buf_size < 12 || (buf[0] & 0xC0) != 0x80)
+    if (!rtc_is_rtp_rtcp(buf, buf_size))
         return 0;
 
     /* Only support audio, video and rtcp. */
-    is_rtcp = buf[1] >= 192 && buf[1] <= 223;
+    is_rtcp = rtc_is_rtcp(buf, buf_size);
     payload_type = buf[1] & 0x7f;
     is_video = payload_type == rtc->video_payload_type;
     if (!is_rtcp && payload_type != rtc->video_payload_type && payload_type != rtc->audio_payload_type)
