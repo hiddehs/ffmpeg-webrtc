@@ -1260,6 +1260,10 @@ static int parse_codec(AVFormatContext *s)
     return 0;
 }
 
+/* Referring to Chrome's definition of RTP payload types. */
+#define RTC_RTP_PAYLOAD_TYPE_H264 106
+#define RTC_RTP_PAYLOAD_TYPE_OPUS 111
+
 /**
  * Generate SDP offer according to the codec parameters, DTLS and ICE information.
  *
@@ -1292,8 +1296,8 @@ static int generate_sdp_offer(AVFormatContext *s)
     rtc->audio_ssrc = av_get_random_seed();
     rtc->video_ssrc = av_get_random_seed();
 
-    rtc->audio_payload_type = 111;
-    rtc->video_payload_type = 106;
+    rtc->audio_payload_type = RTC_RTP_PAYLOAD_TYPE_OPUS;
+    rtc->video_payload_type = RTC_RTP_PAYLOAD_TYPE_H264;
 
     av_bprintf(&bp, ""
         "v=0\r\n"
