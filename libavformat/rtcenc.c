@@ -1069,14 +1069,14 @@ static int isom_read_avcc(AVFormatContext *s, uint8_t *extradata, int  extradata
     nb_sps = avio_r8(pb); /* 3 bits reserved (111) + 5 bits number of sps */
 
     if (version != 1) {
-        av_log(rtc, AV_LOG_ERROR, "Invalid version=%d\n", version);
+        av_log(rtc, AV_LOG_ERROR, "ISOM invalid version=%d\n", version);
         ret = AVERROR_INVALIDDATA;
         goto end;
     }
 
     rtc->avc_nal_length_size = (nal_length_size & 0x03) + 1;
     if (rtc->avc_nal_length_size == 3) {
-        av_log(rtc, AV_LOG_ERROR, "Invalid nal length size=%d\n", rtc->avc_nal_length_size);
+        av_log(rtc, AV_LOG_ERROR, "ISOM invalid nal length size=%d\n", rtc->avc_nal_length_size);
         ret = AVERROR_INVALIDDATA;
         goto end;
     }
@@ -1084,14 +1084,14 @@ static int isom_read_avcc(AVFormatContext *s, uint8_t *extradata, int  extradata
     /* Read SPS */
     nb_sps &= 0x1f;
     if (nb_sps != 1 || avio_feof(pb)) {
-        av_log(rtc, AV_LOG_ERROR, "Invalid number of sps=%d, eof=%d\n", nb_sps, avio_feof(pb));
+        av_log(rtc, AV_LOG_ERROR, "ISOM invalid number of sps=%d, eof=%d\n", nb_sps, avio_feof(pb));
         ret = AVERROR_INVALIDDATA;
         goto end;
     }
 
     rtc->avc_sps_size = avio_rb16(pb); /* sps size */
     if (rtc->avc_sps_size <= 0 || avio_feof(pb)) {
-        av_log(rtc, AV_LOG_ERROR, "Invalid sps size=%d, eof=%d\n", rtc->avc_sps_size, avio_feof(pb));
+        av_log(rtc, AV_LOG_ERROR, "ISOM invalid sps size=%d, eof=%d\n", rtc->avc_sps_size, avio_feof(pb));
         ret = AVERROR_INVALIDDATA;
         goto end;
     }
@@ -1111,14 +1111,14 @@ static int isom_read_avcc(AVFormatContext *s, uint8_t *extradata, int  extradata
     /* Read PPS */
     nb_pps = avio_r8(pb); /* number of pps */
     if (nb_pps != 1 || avio_feof(pb)) {
-        av_log(rtc, AV_LOG_ERROR, "Invalid number of pps=%d, eof=%d\n", nb_pps, avio_feof(pb));
+        av_log(rtc, AV_LOG_ERROR, "ISOM invalid number of pps=%d, eof=%d\n", nb_pps, avio_feof(pb));
         ret = AVERROR_INVALIDDATA;
         goto end;
     }
 
     rtc->avc_pps_size = avio_rb16(pb); /* pps size */
     if (rtc->avc_pps_size <= 0 || avio_feof(pb)) {
-        av_log(rtc, AV_LOG_ERROR, "Invalid pps size=%d, eof=%d\n", rtc->avc_pps_size, avio_feof(pb));
+        av_log(rtc, AV_LOG_ERROR, "ISOM invalid pps size=%d, eof=%d\n", rtc->avc_pps_size, avio_feof(pb));
         ret = AVERROR_INVALIDDATA;
         goto end;
     }
@@ -1131,7 +1131,7 @@ static int isom_read_avcc(AVFormatContext *s, uint8_t *extradata, int  extradata
 
     ret = avio_read(pb, rtc->avc_pps, rtc->avc_pps_size); /* pps */
     if (ret < 0) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to read pps, size=%d\n", rtc->avc_pps_size);
+        av_log(rtc, AV_LOG_ERROR, "ISOM failed to read pps, size=%d\n", rtc->avc_pps_size);
         goto end;
     }
 
@@ -1163,54 +1163,54 @@ static int parse_codec(AVFormatContext *s)
         switch (par->codec_type) {
         case AVMEDIA_TYPE_VIDEO:
             if (rtc->video_par) {
-                av_log(rtc, AV_LOG_ERROR, "Only one video stream is supported by RTC\n");
+                av_log(rtc, AV_LOG_ERROR, "WHIP: Only one video stream is supported by RTC\n");
                 return AVERROR(EINVAL);
             }
             rtc->video_par = par;
 
             if (par->codec_id != AV_CODEC_ID_H264) {
-                av_log(rtc, AV_LOG_ERROR, "Unsupported video codec %s by RTC, choose h264\n",
+                av_log(rtc, AV_LOG_ERROR, "WHIP: Unsupported video codec %s by RTC, choose h264\n",
                        desc ? desc->name : "unknown");
                 return AVERROR_PATCHWELCOME;
             }
 
             if (par->video_delay > 0) {
-                av_log(rtc, AV_LOG_ERROR, "Unsupported B frames by RTC\n");
+                av_log(rtc, AV_LOG_ERROR, "WHIP: Unsupported B frames by RTC\n");
                 return AVERROR_PATCHWELCOME;
             }
 
             ret = isom_read_avcc(s, par->extradata, par->extradata_size);
             if (ret < 0) {
-                av_log(rtc, AV_LOG_ERROR, "Failed to parse SPS/PPS from extradata\n");
+                av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to parse SPS/PPS from extradata\n");
                 return ret;
             }
             break;
         case AVMEDIA_TYPE_AUDIO:
             if (rtc->audio_par) {
-                av_log(rtc, AV_LOG_ERROR, "Only one audio stream is supported by RTC\n");
+                av_log(rtc, AV_LOG_ERROR, "WHIP: Only one audio stream is supported by RTC\n");
                 return AVERROR(EINVAL);
             }
             rtc->audio_par = par;
 
             if (par->codec_id != AV_CODEC_ID_OPUS) {
-                av_log(rtc, AV_LOG_ERROR, "Unsupported audio codec %s by RTC, choose opus\n",
+                av_log(rtc, AV_LOG_ERROR, "WHIP: Unsupported audio codec %s by RTC, choose opus\n",
                     desc ? desc->name : "unknown");
                 return AVERROR_PATCHWELCOME;
             }
 
             if (par->ch_layout.nb_channels != 2) {
-                av_log(rtc, AV_LOG_ERROR, "Unsupported audio channels %d by RTC, choose stereo\n",
+                av_log(rtc, AV_LOG_ERROR, "WHIP: Unsupported audio channels %d by RTC, choose stereo\n",
                     par->ch_layout.nb_channels);
                 return AVERROR_PATCHWELCOME;
             }
 
             if (par->sample_rate != 48000) {
-                av_log(rtc, AV_LOG_ERROR, "Unsupported audio sample rate %d by RTC, choose 48000\n", par->sample_rate);
+                av_log(rtc, AV_LOG_ERROR, "WHIP: Unsupported audio sample rate %d by RTC, choose 48000\n", par->sample_rate);
                 return AVERROR_PATCHWELCOME;
             }
             break;
         default:
-            av_log(rtc, AV_LOG_ERROR, "Codec type '%s' for stream %d is not supported by RTC\n",
+            av_log(rtc, AV_LOG_ERROR, "WHIP: Codec type '%s' for stream %d is not supported by RTC\n",
                    av_get_media_type_string(par->codec_type), i);
             return AVERROR_PATCHWELCOME;
         }
@@ -1237,7 +1237,7 @@ static int generate_sdp_offer(AVFormatContext *s)
     av_bprint_init(&bp, 1, MAX_SDP_SIZE);
 
     if (rtc->sdp_offer) {
-        av_log(rtc, AV_LOG_ERROR, "SDP offer is already set\n");
+        av_log(rtc, AV_LOG_ERROR, "WHIP: SDP offer is already set\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
@@ -1323,7 +1323,7 @@ static int generate_sdp_offer(AVFormatContext *s)
     }
 
     if (!av_bprint_is_complete(&bp)) {
-        av_log(rtc, AV_LOG_ERROR, "Offer exceed max %d, %s\n", MAX_SDP_SIZE, bp.str);
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Offer exceed max %d, %s\n", MAX_SDP_SIZE, bp.str);
         ret = AVERROR(EIO);
         goto end;
     }
@@ -1363,12 +1363,12 @@ static int exchange_sdp(AVFormatContext *s)
 
     ret = ffurl_alloc(&whip_uc, s->url, AVIO_FLAG_READ_WRITE, &s->interrupt_callback);
     if (ret < 0) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to alloc HTTP context: %s\n", s->url);
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to alloc HTTP context: %s\n", s->url);
         goto end;
     }
 
     if (!rtc->sdp_offer || !strlen(rtc->sdp_offer)) {
-        av_log(rtc, AV_LOG_ERROR, "No offer to exchange\n");
+        av_log(rtc, AV_LOG_ERROR, "WHIP: No offer to exchange\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
@@ -1379,7 +1379,7 @@ static int exchange_sdp(AVFormatContext *s)
     if (rtc->authorization)
         ret += snprintf(buf + ret, sizeof(buf) - ret, "Authorization: Bearer %s\r\n", rtc->authorization);
     if (ret <= 0 || ret >= sizeof(buf)) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to generate headers, size=%d, %s\n", ret, buf);
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to generate headers, size=%d, %s\n", ret, buf);
         ret = AVERROR(EINVAL);
         goto end;
     }
@@ -1390,7 +1390,7 @@ static int exchange_sdp(AVFormatContext *s)
 
     ret = ffurl_connect(whip_uc, NULL);
     if (ret < 0) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to request url=%s, offer: %s\n", s->url, rtc->sdp_offer);
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to request url=%s, offer: %s\n", s->url, rtc->sdp_offer);
         goto end;
     }
 
@@ -1410,21 +1410,21 @@ static int exchange_sdp(AVFormatContext *s)
             break;
         }
         if (ret <= 0) {
-            av_log(rtc, AV_LOG_ERROR, "Failed to read response from url=%s, offer is %s, answer is %s\n",
+            av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to read response from url=%s, offer is %s, answer is %s\n",
                 s->url, rtc->sdp_offer, rtc->sdp_answer);
             goto end;
         }
 
         av_bprintf(&bp, "%.*s", ret, buf);
         if (!av_bprint_is_complete(&bp)) {
-            av_log(rtc, AV_LOG_ERROR, "Answer exceed max size %d, %.*s, %s\n", MAX_SDP_SIZE, ret, buf, bp.str);
+            av_log(rtc, AV_LOG_ERROR, "WHIP: Answer exceed max size %d, %.*s, %s\n", MAX_SDP_SIZE, ret, buf, bp.str);
             ret = AVERROR(EIO);
             goto end;
         }
     }
 
     if (!av_strstart(bp.str, "v=", NULL)) {
-        av_log(rtc, AV_LOG_ERROR, "Invalid answer: %s\n", bp.str);
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Invalid answer: %s\n", bp.str);
         ret = AVERROR(EINVAL);
         goto end;
     }
@@ -1466,7 +1466,7 @@ static int parse_answer(AVFormatContext *s)
     RTCContext *rtc = s->priv_data;
 
     if (!rtc->sdp_answer || !strlen(rtc->sdp_answer)) {
-        av_log(rtc, AV_LOG_ERROR, "No answer to parse\n");
+        av_log(rtc, AV_LOG_ERROR, "WHIP: No answer to parse\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
@@ -1496,14 +1496,14 @@ static int parse_answer(AVFormatContext *s)
                 int priority, port;
                 ret = sscanf(ptr, "%16s %d %128s %d typ host", protocol, &priority, host, &port);
                 if (ret != 4) {
-                    av_log(rtc, AV_LOG_ERROR, "Failed %d to parse line %d %s from %s\n",
+                    av_log(rtc, AV_LOG_ERROR, "WHIP: Failed %d to parse line %d %s from %s\n",
                         ret, i, line, rtc->sdp_answer);
                     ret = AVERROR(EIO);
                     goto end;
                 }
 
                 if (av_strcasecmp(protocol, "udp")) {
-                    av_log(rtc, AV_LOG_ERROR, "Protocol %s is not supported by RTC, choose udp, line %d %s of %s\n",
+                    av_log(rtc, AV_LOG_ERROR, "WHIP: Protocol %s is not supported by RTC, choose udp, line %d %s of %s\n",
                         protocol, i, line, rtc->sdp_answer);
                     ret = AVERROR(EIO);
                     goto end;
@@ -1521,19 +1521,19 @@ static int parse_answer(AVFormatContext *s)
     }
 
     if (!rtc->ice_pwd_remote || !strlen(rtc->ice_pwd_remote)) {
-        av_log(rtc, AV_LOG_ERROR, "No remote ice pwd parsed from %s\n", rtc->sdp_answer);
+        av_log(rtc, AV_LOG_ERROR, "WHIP: No remote ice pwd parsed from %s\n", rtc->sdp_answer);
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     if (!rtc->ice_ufrag_remote || !strlen(rtc->ice_ufrag_remote)) {
-        av_log(rtc, AV_LOG_ERROR, "No remote ice ufrag parsed from %s\n", rtc->sdp_answer);
+        av_log(rtc, AV_LOG_ERROR, "WHIP: No remote ice ufrag parsed from %s\n", rtc->sdp_answer);
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     if (!rtc->ice_protocol || !rtc->ice_host || !rtc->ice_port) {
-        av_log(rtc, AV_LOG_ERROR, "No ice candidate parsed from %s\n", rtc->sdp_answer);
+        av_log(rtc, AV_LOG_ERROR, "WHIP: No ice candidate parsed from %s\n", rtc->sdp_answer);
         ret = AVERROR(EINVAL);
         goto end;
     }
@@ -1592,7 +1592,7 @@ static int ice_create_request(AVFormatContext *s, uint8_t *buf, int buf_size, in
     /* The username is the concatenation of the two ICE ufrag */
     ret = snprintf(username, sizeof(username), "%s:%s", rtc->ice_ufrag_remote, rtc->ice_ufrag_local);
     if (ret <= 0 || ret >= sizeof(username)) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to build username %s:%s, max=%lu, ret=%d\n",
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to build username %s:%s, max=%lu, ret=%d\n",
             rtc->ice_ufrag_remote, rtc->ice_ufrag_local, sizeof(username), ret);
         ret = AVERROR(EIO);
         goto end;
@@ -1660,7 +1660,7 @@ static int ice_create_response(AVFormatContext *s, char *tid, int tid_size, uint
     RTCContext *rtc = s->priv_data;
 
     if (tid_size != 12) {
-        av_log(rtc, AV_LOG_ERROR, "Invalid transaction ID size. Expected 12, got %d\n", tid_size);
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Invalid transaction ID size. Expected 12, got %d\n", tid_size);
         return AVERROR(EINVAL);
     }
 
@@ -1733,7 +1733,7 @@ static int ice_handle_binding_request(AVFormatContext *s, char *buf, int buf_siz
         return ret;
 
     if (buf_size < 20) {
-        av_log(rtc, AV_LOG_ERROR, "Invalid STUN message size. Expected at least 20, got %d\n", buf_size);
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Invalid STUN message size. Expected at least 20, got %d\n", buf_size);
         return AVERROR(EINVAL);
     }
 
@@ -1743,13 +1743,13 @@ static int ice_handle_binding_request(AVFormatContext *s, char *buf, int buf_siz
     /* Build the STUN binding response. */
     ret = ice_create_response(s, tid, sizeof(tid), rtc->buf, sizeof(rtc->buf), &size);
     if (ret < 0) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to create STUN binding response, size=%d\n", size);
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to create STUN binding response, size=%d\n", size);
         return ret;
     }
 
     ret = ffurl_write(rtc->udp_uc, rtc->buf, size);
     if (ret < 0) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to send STUN binding response, size=%d\n", size);
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to send STUN binding response, size=%d\n", size);
         return ret;
     }
 
@@ -1771,7 +1771,7 @@ static int udp_connect(AVFormatContext *s)
     ff_url_join(url, sizeof(url), "udp", NULL, rtc->ice_host, rtc->ice_port, NULL);
     ret = ffurl_alloc(&rtc->udp_uc, url, AVIO_FLAG_WRITE, &s->interrupt_callback);
     if (ret < 0) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to open udp://%s:%d\n", rtc->ice_host, rtc->ice_port);
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to open udp://%s:%d\n", rtc->ice_host, rtc->ice_port);
         return ret;
     }
 
@@ -1783,7 +1783,7 @@ static int udp_connect(AVFormatContext *s)
 
     ret = ffurl_connect(rtc->udp_uc, NULL);
     if (ret < 0) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to connect udp://%s:%d\n", rtc->ice_host, rtc->ice_port);
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to connect udp://%s:%d\n", rtc->ice_host, rtc->ice_port);
         return ret;
     }
 
@@ -1816,13 +1816,13 @@ static int ice_dtls_handshake(AVFormatContext *s)
             /* Build the STUN binding request. */
             ret = ice_create_request(s, rtc->buf, sizeof(rtc->buf), &size);
             if (ret < 0) {
-                av_log(rtc, AV_LOG_ERROR, "Failed to create STUN binding request, size=%d\n", size);
+                av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to create STUN binding request, size=%d\n", size);
                 goto end;
             }
 
             ret = ffurl_write(rtc->udp_uc, rtc->buf, size);
             if (ret < 0) {
-                av_log(rtc, AV_LOG_ERROR, "Failed to send STUN binding request, size=%d\n", size);
+                av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to send STUN binding request, size=%d\n", size);
                 goto end;
             }
 
@@ -1852,7 +1852,7 @@ next_packet:
                 av_usleep(5 * 1000);
                 continue;
             }
-            av_log(rtc, AV_LOG_ERROR, "Failed to read message\n");
+            av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to read message\n");
             goto end;
         }
 
@@ -1934,20 +1934,20 @@ static int setup_srtp(AVFormatContext *s)
 
     /* Setup SRTP context for outgoing packets */
     if (!av_base64_encode(buf, sizeof(buf), send_key, sizeof(send_key))) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to encode send key\n");
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to encode send key\n");
         ret = AVERROR(EIO);
         goto end;
     }
 
     ret = ff_srtp_set_crypto(&rtc->srtp_audio_send, suite, buf);
     if (ret < 0) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to set crypto for audio send\n");
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to set crypto for audio send\n");
         goto end;
     }
 
     ret = ff_srtp_set_crypto(&rtc->srtp_video_send, suite, buf);
     if (ret < 0) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to set crypto for video send\n");
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to set crypto for video send\n");
         goto end;
     }
 
@@ -1959,14 +1959,14 @@ static int setup_srtp(AVFormatContext *s)
 
     /* Setup SRTP context for incoming packets */
     if (!av_base64_encode(buf, sizeof(buf), recv_key, sizeof(recv_key))) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to encode recv key\n");
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to encode recv key\n");
         ret = AVERROR(EIO);
         goto end;
     }
 
     ret = ff_srtp_set_crypto(&rtc->srtp_recv, suite, buf);
     if (ret < 0) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to set crypto for recv\n");
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to set crypto for recv\n");
         goto end;
     }
 
@@ -2004,7 +2004,7 @@ static int create_rtp_muxer(AVFormatContext *s)
 
     const AVOutputFormat *rtp_format = av_guess_format("rtp", NULL, NULL);
     if (!rtp_format) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to guess rtp muxer\n");
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to guess rtp muxer\n");
         ret = AVERROR(ENOSYS);
         goto end;
     }
@@ -2063,7 +2063,7 @@ static int create_rtp_muxer(AVFormatContext *s)
 
         ret = avformat_write_header(rtp_ctx, &opts);
         if (ret < 0) {
-            av_log(rtc, AV_LOG_ERROR, "Failed to write rtp header\n");
+            av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to write rtp header\n");
             goto end;
         }
 
@@ -2147,13 +2147,13 @@ static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size)
     /* Encrypt by SRTP and send out. */
     cipher_size = ff_srtp_encrypt(srtp, buf, buf_size, rtc->buf, sizeof(rtc->buf));
     if (cipher_size <= 0 || cipher_size < buf_size) {
-        av_log(rtc, AV_LOG_WARNING, "Failed to encrypt packet=%dB, cipher=%dB\n", buf_size, cipher_size);
+        av_log(rtc, AV_LOG_WARNING, "WHIP: Failed to encrypt packet=%dB, cipher=%dB\n", buf_size, cipher_size);
         return 0;
     }
 
     ret = ffurl_write(rtc->udp_uc, rtc->buf, cipher_size);
     if (ret < 0) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to write packet=%dB, ret=%d\n", cipher_size, ret);
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to write packet=%dB, ret=%d\n", cipher_size, ret);
         return ret;
     }
 
@@ -2188,7 +2188,7 @@ static int insert_sps_pps_packet(AVFormatContext *s, AVPacket *pkt)
             rtc->avc_nal_length_size * 2 + rtc->avc_sps_size + rtc->avc_pps_size;
     ret = av_new_packet(extra, size);
     if (ret < 0) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to allocate extra packet\n");
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to allocate extra packet\n");
         goto end;
     }
 
@@ -2247,7 +2247,7 @@ static int whip_dispose(AVFormatContext *s)
 
     ret = ffurl_alloc(&whip_uc, rtc->whip_resource_url, AVIO_FLAG_READ_WRITE, &s->interrupt_callback);
     if (ret < 0) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to alloc WHIP delete context: %s\n", s->url);
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to alloc WHIP delete context: %s\n", s->url);
         goto end;
     }
 
@@ -2255,7 +2255,7 @@ static int whip_dispose(AVFormatContext *s)
     av_opt_set(whip_uc->priv_data, "method", "DELETE", 0);
     ret = ffurl_connect(whip_uc, NULL);
     if (ret < 0) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to DELETE url=%s\n", rtc->whip_resource_url);
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to DELETE url=%s\n", rtc->whip_resource_url);
         goto end;
     }
 
@@ -2266,7 +2266,7 @@ static int whip_dispose(AVFormatContext *s)
             break;
         }
         if (ret < 0) {
-            av_log(rtc, AV_LOG_ERROR, "Failed to read response from DELETE url=%s\n", rtc->whip_resource_url);
+            av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to read response from DELETE url=%s\n", rtc->whip_resource_url);
             goto end;
         }
     }
@@ -2335,12 +2335,12 @@ static int rtc_write_packet(AVFormatContext *s, AVPacket *pkt)
     if (ret > 0) {
         if (is_dtls_packet(rtc->buf, ret)) {
             if ((ret = dtls_context_write(&rtc->dtls_ctx, rtc->buf, ret)) < 0) {
-                av_log(rtc, AV_LOG_ERROR, "Failed to handle DTLS message\n");
+                av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to handle DTLS message\n");
                 goto end;
             }
         }
     } else if (ret != AVERROR(EAGAIN)) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to read from UDP socket\n");
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to read from UDP socket\n");
         goto end;
     }
 
@@ -2357,17 +2357,17 @@ static int rtc_write_packet(AVFormatContext *s, AVPacket *pkt)
 
     ret = insert_sps_pps_packet(s, pkt);
     if (ret < 0) {
-        av_log(rtc, AV_LOG_ERROR, "Failed to insert SPS/PPS packet\n");
+        av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to insert SPS/PPS packet\n");
         goto end;
     }
 
     ret = ff_write_chained(rtp_ctx, 0, pkt, s, 0);
     if (ret < 0) {
         if (ret == AVERROR(EINVAL)) {
-            av_log(rtc, AV_LOG_WARNING, "Ignore failed to write packet=%dB, ret=%d\n", pkt->size, ret);
+            av_log(rtc, AV_LOG_WARNING, "WHIP: Ignore failed to write packet=%dB, ret=%d\n", pkt->size, ret);
             ret = 0;
         } else
-            av_log(rtc, AV_LOG_ERROR, "Failed to write packet, size=%d\n", pkt->size);
+            av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to write packet, size=%d\n", pkt->size);
         goto end;
     }
 
@@ -2388,7 +2388,7 @@ static av_cold void rtc_deinit(AVFormatContext *s)
 
     ret = whip_dispose(s);
     if (ret < 0)
-        av_log(rtc, AV_LOG_WARNING, "Failed to dispose resource, ret=%d\n", ret);
+        av_log(rtc, AV_LOG_WARNING, "WHIP: Failed to dispose resource, ret=%d\n", ret);
 
     for (i = 0; i < s->nb_streams; i++) {
         AVFormatContext* rtp_ctx = s->streams[i]->priv_data;
