@@ -145,6 +145,13 @@
 #define RTC_RTCP_PT_START 192
 #define RTC_RTCP_PT_END   223
 
+/**
+ * In the case of ICE-LITE, these fields are not used; instead, they are defined
+ * as constant values.
+ */
+#define RTC_SDP_SESSION_ID "4489045141692799359"
+#define RTC_SDP_CREATOR_IP "127.0.0.1"
+
 /* Calculate the elapsed time from starttime to endtime in milliseconds. */
 #define ELAPSED(starttime, endtime) ((int)(endtime - starttime) / 1000)
 
@@ -1329,12 +1336,14 @@ static int generate_sdp_offer(AVFormatContext *s)
 
     av_bprintf(&bp, ""
         "v=0\r\n"
-        "o=FFmpeg 4489045141692799359 2 IN IP4 127.0.0.1\r\n"
+        "o=FFmpeg %s 2 IN IP4 %s\r\n"
         "s=FFmpegPublishSession\r\n"
         "t=0 0\r\n"
         "a=group:BUNDLE 0 1\r\n"
         "a=extmap-allow-mixed\r\n"
-        "a=msid-semantic: WMS\r\n");
+        "a=msid-semantic: WMS\r\n",
+        RTC_SDP_SESSION_ID,
+        RTC_SDP_CREATOR_IP);
 
     if (rtc->audio_par) {
         av_bprintf(&bp, ""
