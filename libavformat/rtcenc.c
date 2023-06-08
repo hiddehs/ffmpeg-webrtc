@@ -2450,14 +2450,16 @@ static int rtc_write_packet(AVFormatContext *s, AVPacket *pkt)
         goto end;
     }
 
-    /* For audio OPUS stream, correct the timestamp. */
+    /* For audio stream, correct the timestamp. */
     if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
         pkt->dts = pkt->pts = rtc->audio_jitter_base;
-        // TODO: FIXME: For opus 48khz, each frame is 20ms which is 48000*20/1000 = 960. It appears that there is a
-        //  bug introduced by libopus regarding the timestamp. Instead of being exactly 960, there is a slight
-        //  deviation, such as 956 or 970. This deviation can cause Chrome to play the audio stream with noise.
-        //  Although we are unsure of the root cause, we can simply correct the timestamp by using the timebase of
-        //  Opus. We need to conduct further research and remove this line.
+        /**
+         * TODO: FIXME: For opus 48khz, each frame is 20ms which is 48000*20/1000 = 960. It appears that there is a
+         *  bug introduced by libopus regarding the timestamp. Instead of being exactly 960, there is a slight
+         *  deviation, such as 956 or 970. This deviation can cause Chrome to play the audio stream with noise.
+         *  Although we are unsure of the root cause, we can simply correct the timestamp by using the timebase of
+         *  Opus. We need to conduct further research and remove this line.
+         */
         rtc->audio_jitter_base += 960;
     }
 
