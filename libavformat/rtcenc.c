@@ -72,12 +72,6 @@
 #define DTLS_SRTP_CHECKSUM_LEN 16
 
 /**
- * STAP-A stands for Single-Time Aggregation Packet.
- * The NALU type for STAP-A is 24 (0x18).
- */
-#define NALU_TYPE_STAP_A 24
-
-/**
  * When sending ICE or DTLS messages, responses are received via UDP. However, the peer
  * may not be ready and return EAGAIN, in which case we should wait for a short duration
  * and retry reading.
@@ -1984,7 +1978,7 @@ end:
 static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size)
 {
     int ret, cipher_size, is_rtcp, is_video;
-    uint8_t payload_type, nalu_header;
+    uint8_t payload_type;
     AVFormatContext *s = opaque;
     RTCContext *rtc = s->priv_data;
     SRTPContext *srtp;
@@ -1999,27 +1993,6 @@ static int on_rtp_write_packet(void *opaque, uint8_t *buf, int buf_size)
     is_video = payload_type == rtc->video_payload_type;
     if (!is_rtcp && payload_type != rtc->video_payload_type && payload_type != rtc->audio_payload_type)
         return 0;
-
-    /**
-     * For video, the STAP-A with SPS/PPS should:
-     * 1. The marker bit should be 0, never be 1.
-     * 2. The NRI should equal to the first NALU's.
-     * TODO: FIXME: Should fix it in rtpenc.c
-     * TODO: FIXME: It appears that this code may be redundant when using the Bitstream Filter (BSF),
-     *  as Chrome continues to function properly even after its removal.
-     */
-    if (is_video && buf_size > 12) {
-        nalu_header = buf[12] & 0x1f;
-        if (nalu_header == NALU_TYPE_STAP_A) {
-            /* Reset the marker bit to 0. */
-            if (buf[1] & 0x80)
-                buf[1] &= 0x7f;
-
-            /* Reset the NRI to the first NALU's NRI. */
-            if (buf_size > 15 && (buf[15]&0x60) != (buf[12]&0x60))
-                buf[12] = (buf[12]&0x80) | (buf[15]&0x60) | (buf[12]&0x1f);
-        }
-    }
 
     /* Get the corresponding SRTP context. */
     srtp = is_rtcp ? &rtc->srtp_rtcp_send : (is_video? &rtc->srtp_video_send : &rtc->srtp_audio_send);
