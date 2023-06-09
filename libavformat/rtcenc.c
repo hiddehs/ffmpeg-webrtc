@@ -986,9 +986,6 @@ typedef struct RTCContext {
     /* The SRTP receive context, to decrypt incoming packets. */
     SRTPContext srtp_recv;
 
-    /* The time jitter base for audio OPUS stream. */
-    int64_t audio_jitter_base;
-
     /* The UDP transport is used for delivering ICE, DTLS and SRTP packets. */
     URLContext *udp_uc;
     /* The buffer for UDP transmission. */
@@ -1107,6 +1104,15 @@ static av_cold int whip_init(AVFormatContext *s)
  *
  * @param s Pointer to the AVFormatContext
  * @returns Returns 0 if successful or AVERROR_xxx in case of an error.
+ *
+ * TODO: FIXME: There is an issue with the timestamp of OPUS audio, especially when
+ *  the input is an MP4 file. The timestamp deviates from the expected value of 960,
+ *  causing Chrome to play the audio stream with noise. This problem can be replicated
+ *  by transcoding a specific file into MP4 format and publishing it using the WHIP
+ *  muxer. However, when directly transcoding and publishing through the WHIP muxer,
+ *  the issue is not present, and the audio timestamp remains consistent. The root
+ *  cause is still unknown, and this comment has been added to address this issue
+ *  in the future. Further research is needed to resolve the problem.
  */
 static int parse_codec(AVFormatContext *s)
 {
@@ -1156,15 +1162,6 @@ static int parse_codec(AVFormatContext *s)
 
             if (par->sample_rate != 48000) {
                 av_log(rtc, AV_LOG_ERROR, "WHIP: Unsupported audio sample rate %d by RTC, choose 48000\n", par->sample_rate);
-                return AVERROR_PATCHWELCOME;
-            }
-
-            // TODO: FIXME: Use opus_metadata BSF to parse it.
-            if (rtc->audio_par->frame_size <= 0)
-                rtc->audio_par->frame_size = 960;
-
-            if (rtc->audio_par->frame_size <= 0) {
-                av_log(rtc, AV_LOG_ERROR, "WHIP: Unsupported audio frame size %d by RTC\n", rtc->audio_par->frame_size);
                 return AVERROR_PATCHWELCOME;
             }
             break;
@@ -2280,19 +2277,6 @@ static int rtc_write_packet(AVFormatContext *s, AVPacket *pkt)
     } else if (ret != AVERROR(EAGAIN)) {
         av_log(rtc, AV_LOG_ERROR, "WHIP: Failed to read from UDP socket\n");
         goto end;
-    }
-
-    /* For audio stream, correct the timestamp. */
-    if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-        pkt->dts = pkt->pts = rtc->audio_jitter_base;
-        /**
-         * TODO: FIXME: For opus 48khz, each frame is 20ms which is 48000*20/1000 = 960. It appears that there is a
-         *  bug introduced by libopus regarding the timestamp. Instead of being exactly 960, there is a slight
-         *  deviation, such as 956 or 970. This deviation can cause Chrome to play the audio stream with noise.
-         *  Although we are unsure of the root cause, we can simply correct the timestamp by using the timebase of
-         *  Opus. We need to conduct further research and remove this line.
-         */
-        rtc->audio_jitter_base += rtc->audio_par->frame_size;
     }
 
     ret = ff_write_chained(rtp_ctx, 0, pkt, s, 0);
