@@ -31,7 +31,6 @@
 #include "libavutil/opt.h"
 #include "libavutil/random_seed.h"
 #include "libavutil/time.h"
-#include "avc.h"
 #include "avio_internal.h"
 #include "http.h"
 #include "internal.h"
