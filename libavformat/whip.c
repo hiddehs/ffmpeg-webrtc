@@ -146,7 +146,7 @@
  * In the case of ICE-LITE, these fields are not used; instead, they are defined
  * as constant values.
  */
-#define WHIP_SDP_SESSION_ID "4489045141692799359"
+#define WHIP_SDP_SESSION_ID "1692799359"
 #define WHIP_SDP_CREATOR_IP "127.0.0.1"
 
 /* Calculate the elapsed time from starttime to endtime in milliseconds. */
@@ -1322,20 +1322,19 @@ static int parse_codec(AVFormatContext *s)
 /**
  * Generate SDP offer according to the codec parameters, DTLS and ICE information.
  *
- * Note that we don't use av_sdp_create to generate SDP offer because it doesn't
- * support DTLS and ICE information.
- *
  * @return 0 if OK, AVERROR_xxx on error
  */
 static int generate_sdp_offer(AVFormatContext *s)
 {
-    int ret = 0, profile, level, profile_iop;
-    const char *acodec_name = NULL, *vcodec_name = NULL;
-    AVBPrint bp;
+    int ret = 0;
+    AVDictionary *opts = NULL;
+    char *sdp, url[MAX_URL_SIZE];
+    AVFormatContext sdp_ctx, *ctx_array[1];
     WHIPContext *whip = s->priv_data;
-
-    /* To prevent a crash during cleanup, always initialize it. */
-    av_bprint_init(&bp, 1, MAX_SDP_SIZE);
+    /*
+    int profile, level, profile_iop;
+    const char *acodec_name = NULL, *vcodec_name = NULL;
+    */
 
     if (whip->sdp_offer) {
         av_log(whip, AV_LOG_ERROR, "WHIP: SDP offer is already set\n");
@@ -1355,93 +1354,57 @@ static int generate_sdp_offer(AVFormatContext *s)
     whip->audio_payload_type = WHIP_RTP_PAYLOAD_TYPE_OPUS;
     whip->video_payload_type = WHIP_RTP_PAYLOAD_TYPE_H264;
 
-    av_bprintf(&bp, ""
-        "v=0\r\n"
-        "o=FFmpeg %s 2 IN IP4 %s\r\n"
-        "s=FFmpegPublishSession\r\n"
-        "t=0 0\r\n"
-        "a=group:BUNDLE 0 1\r\n"
-        "a=extmap-allow-mixed\r\n"
-        "a=msid-semantic: WMS\r\n",
-        WHIP_SDP_SESSION_ID,
-        WHIP_SDP_CREATOR_IP);
-
-    if (whip->audio_par) {
-        if (whip->audio_par->codec_id == AV_CODEC_ID_OPUS)
-            acodec_name = "opus";
-
-        av_bprintf(&bp, ""
-            "m=audio 9 UDP/TLS/RTP/SAVPF %u\r\n"
-            "c=IN IP4 0.0.0.0\r\n"
-            "a=ice-ufrag:%s\r\n"
-            "a=ice-pwd:%s\r\n"
-            "a=fingerprint:sha-256 %s\r\n"
-            "a=setup:passive\r\n"
-            "a=mid:0\r\n"
-            "a=sendonly\r\n"
-            "a=msid:FFmpeg audio\r\n"
-            "a=rtcp-mux\r\n"
-            "a=rtpmap:%u %s/%d/%d\r\n"
-            "a=ssrc:%u cname:FFmpeg\r\n"
-            "a=ssrc:%u msid:FFmpeg audio\r\n",
-            whip->audio_payload_type,
-            whip->ice_ufrag_local,
-            whip->ice_pwd_local,
-            whip->dtls_ctx.dtls_fingerprint,
-            whip->audio_payload_type,
-            acodec_name,
-            whip->audio_par->sample_rate,
-            whip->audio_par->ch_layout.nb_channels,
-            whip->audio_ssrc,
-            whip->audio_ssrc);
-    }
-
-    if (whip->video_par) {
-        profile_iop = profile = whip->video_par->profile;
-        level = whip->video_par->level;
-        if (whip->video_par->codec_id == AV_CODEC_ID_H264) {
-            vcodec_name = "H264";
-            profile_iop &= FF_PROFILE_H264_CONSTRAINED;
-            profile &= (~FF_PROFILE_H264_CONSTRAINED);
-        }
-
-        av_bprintf(&bp, ""
-            "m=video 9 UDP/TLS/RTP/SAVPF %u\r\n"
-            "c=IN IP4 0.0.0.0\r\n"
-            "a=ice-ufrag:%s\r\n"
-            "a=ice-pwd:%s\r\n"
-            "a=fingerprint:sha-256 %s\r\n"
-            "a=setup:passive\r\n"
-            "a=mid:1\r\n"
-            "a=sendonly\r\n"
-            "a=msid:FFmpeg video\r\n"
-            "a=rtcp-mux\r\n"
-            "a=rtcp-rsize\r\n"
-            "a=rtpmap:%u %s/90000\r\n"
-            "a=fmtp:%u level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=%02x%02x%02x\r\n"
-            "a=ssrc:%u cname:FFmpeg\r\n"
-            "a=ssrc:%u msid:FFmpeg video\r\n",
-            whip->video_payload_type,
-            whip->ice_ufrag_local,
-            whip->ice_pwd_local,
-            whip->dtls_ctx.dtls_fingerprint,
-            whip->video_payload_type,
-            vcodec_name,
-            whip->video_payload_type,
-            profile,
-            profile_iop,
-            level,
-            whip->video_ssrc,
-            whip->video_ssrc);
-    }
-
-    if (!av_bprint_is_complete(&bp)) {
-        av_log(whip, AV_LOG_ERROR, "WHIP: Offer exceed max %d, %s\n", MAX_SDP_SIZE, bp.str);
-        ret = AVERROR(EIO);
+    sdp = av_mallocz(MAX_SDP_SIZE);
+    if (!sdp) {
+        ret = AVERROR(ENOMEM);
         goto end;
     }
 
-    whip->sdp_offer = av_strdup(bp.str);
+    av_dict_set(&opts, "mode", "whip", 0);
+    av_dict_set(&opts, "session_user", "FFmpeg", 0);
+    av_dict_set(&opts, "session_src_addr", WHIP_SDP_CREATOR_IP, 0);
+    av_dict_set(&opts, "session_id", WHIP_SDP_SESSION_ID, 0);
+    av_dict_set(&opts, "session_version", "2", 0);
+    av_dict_set(&opts, "session_name", "FFmpegPublishSession", 0);
+    av_dict_set(&opts, "media_proto", "UDP/TLS/RTP/SAVPF", 0);
+    av_dict_set(&opts, "media_dest_addr", "0.0.0.0", 0);
+    av_dict_set(&opts, "media_ice_ufrag", whip->ice_ufrag_local, 0);
+    av_dict_set(&opts, "media_ice_pwd", whip->ice_pwd_local, 0);
+    av_dict_set(&opts, "media_fingerprint", whip->dtls_ctx.dtls_fingerprint, 0);
+    av_dict_set_int(&opts, "media_audio_payload_type", whip->audio_payload_type, 0);
+    av_dict_set_int(&opts, "media_audio_mid", 0, 0);
+    av_dict_set(&opts, "media_audio_msid", "FFmpeg", 0);
+    av_dict_set(&opts, "media_audio_msid_tracker", "audio", 0);
+    av_dict_set_int(&opts, "media_audio_ssrc", whip->audio_ssrc, 0);
+    av_dict_set_int(&opts, "media_video_payload_type", whip->video_payload_type, 0);
+    av_dict_set_int(&opts, "media_video_mid", 1, 0);
+    av_dict_set(&opts, "media_video_msid", "FFmpeg", 0);
+    av_dict_set(&opts, "media_video_msid_tracker", "video", 0);
+    av_dict_set_int(&opts, "media_video_ssrc", whip->video_ssrc, 0);
+
+    /* We create the SDP based on the WHIP AVFormatContext where we
+     * aren't allowed to change the filename field. (We create the SDP
+     * based on the WHIP context since the contexts for the RTP streams
+     * don't exist yet.) In order to specify a custom URL with the actual
+     * peer IP instead of the originally specified hostname, we create
+     * a temporary copy of the AVFormatContext, where the custom URL is set.
+     *
+     * FIXME: Create the SDP without copying the AVFormatContext.
+     * This either requires setting up the RTP stream AVFormatContexts
+     * already here (complicating things immensely) or getting a more
+     * flexible SDP creation interface.
+     */
+    sdp_ctx = *s;
+    sdp_ctx.url = url;
+    ff_url_join(url, sizeof(url), "whip", NULL, WHIP_SDP_CREATOR_IP, -1, NULL);
+    ctx_array[0] = &sdp_ctx;
+    ret = av_sdp_create(ctx_array, 1, sdp, MAX_SDP_SIZE, &opts);
+    if (ret < 0) {
+        av_log(whip, AV_LOG_ERROR, "WHIP: Failed to create SDP offer\n");
+        goto end;
+    }
+
+    whip->sdp_offer = av_strdup(sdp);
     if (!whip->sdp_offer) {
         ret = AVERROR(ENOMEM);
         goto end;
@@ -1453,7 +1416,8 @@ static int generate_sdp_offer(AVFormatContext *s)
     av_log(whip, AV_LOG_VERBOSE, "WHIP: Generated state=%d, offer: %s\n", whip->state, whip->sdp_offer);
 
 end:
-    av_bprint_finalize(&bp, NULL);
+    av_freep(&sdp);
+    av_dict_free(&opts);
     return ret;
 }
 

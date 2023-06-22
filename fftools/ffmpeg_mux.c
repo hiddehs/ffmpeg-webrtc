@@ -548,7 +548,7 @@ static int print_sdp(void)
         goto fail;
     }
 
-    ret = av_sdp_create(avc, j, sdp, sizeof(sdp));
+    ret = av_sdp_create(avc, j, sdp, sizeof(sdp), NULL);
     if (ret < 0)
         goto fail;
 

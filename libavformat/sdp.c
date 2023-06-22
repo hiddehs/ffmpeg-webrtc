@@ -74,18 +74,39 @@ static void sdp_write_address(char *buff, int size, const char *dest_addr,
     }
 }
 
-static void sdp_write_header(char *buff, int size, struct sdp_session_level *s)
+static void sdp_write_header(char *buff, int size, struct sdp_session_level *s, AVDictionary **options)
 {
+    AVDictionaryEntry *e;
+    int is_whip = 0;
+
+    AVDictionary *tmp_opts = NULL;
+    if (!options)
+        options = &tmp_opts;
+
+    if ((e = av_dict_get(*options, "mode", NULL, 0)) != NULL && e->value)
+        is_whip = !av_strncasecmp(e->value, "whip", 4);
+
+    if (is_whip) {
+        (e = av_dict_get(*options, "session_user", NULL, 0)) && (s->user = e->value);
+        (e = av_dict_get(*options, "session_src_addr", NULL, 0)) && (s->src_addr = e->value);
+        (e = av_dict_get(*options, "session_id", NULL, 0)) && (s->id = atoi(e->value));
+        (e = av_dict_get(*options, "session_version", NULL, 0)) && (s->version = atoi(e->value));
+        (e = av_dict_get(*options, "session_name", NULL, 0)) && (s->name = e->value);
+    }
+
     av_strlcatf(buff, size, "v=%d\r\n"
-                            "o=- %d %d IN %s %s\r\n"
+                            "o=%s %d %d IN %s %s\r\n"
                             "s=%s\r\n",
                             s->sdp_version,
-                            s->id, s->version, s->src_type, s->src_addr,
+                            s->user, s->id, s->version, s->src_type, s->src_addr,
                             s->name);
-    sdp_write_address(buff, size, s->dst_addr, s->dst_type, s->ttl);
-    av_strlcatf(buff, size, "t=%d %d\r\n"
-                            "a=tool:libavformat " AV_STRINGIFY(LIBAVFORMAT_VERSION) "\r\n",
-                            s->start_time, s->end_time);
+    if (!is_whip)
+        sdp_write_address(buff, size, s->dst_addr, s->dst_type, s->ttl);
+    av_strlcatf(buff, size, "t=%d %d\r\n", s->start_time, s->end_time);
+    if (!is_whip)
+        av_strlcatf(buff, size, "a=tool:libavformat " AV_STRINGIFY(LIBAVFORMAT_VERSION) "\r\n");
+    else
+        av_strlcatf(buff, size, "a=group:BUNDLE 0 1\r\na=extmap-allow-mixed\r\na=msid-semantic: WMS\r\n");
 }
 
 #if CONFIG_NETWORK
@@ -154,17 +175,26 @@ static int sdp_get_address(char *dest_addr, int size, int *ttl, const char *url)
 }
 
 #define MAX_PSET_SIZE 1024
-static int extradata2psets(AVFormatContext *s, const AVCodecParameters *par,
+static int extradata2psets(AVFormatContext *s, const AVCodecParameters *par, AVDictionary **options,
                            char **out)
 {
     char *psets, *p;
     const uint8_t *r;
-    static const char pset_string[] = "; sprop-parameter-sets=";
-    static const char profile_string[] = "; profile-level-id=";
+    static const char pset_string[] = ";sprop-parameter-sets=";
+    static const char profile_string[] = ";profile-level-id=";
     uint8_t *extradata = par->extradata;
     int extradata_size = par->extradata_size;
     uint8_t *tmpbuf = NULL;
     const uint8_t *sps = NULL, *sps_end;
+    AVDictionaryEntry *e;
+    int is_whip = 0;
+
+    AVDictionary *tmp_opts = NULL;
+    if (!options)
+        options = &tmp_opts;
+
+    if ((e = av_dict_get(*options, "mode", NULL, 0)) != NULL && e->value)
+        is_whip = !av_strncasecmp(e->value, "whip", 4);
 
     *out = NULL;
 
@@ -181,14 +211,16 @@ static int extradata2psets(AVFormatContext *s, const AVCodecParameters *par,
         tmpbuf = extradata;
     }
 
-    psets = av_mallocz(MAX_PSET_SIZE);
+    p = psets = av_mallocz(MAX_PSET_SIZE);
     if (!psets) {
         av_log(s, AV_LOG_ERROR, "Cannot allocate memory for the parameter sets.\n");
         av_free(tmpbuf);
         return AVERROR(ENOMEM);
     }
-    memcpy(psets, pset_string, strlen(pset_string));
-    p = psets + strlen(pset_string);
+    if (!is_whip) {
+        memcpy(psets, pset_string, strlen(pset_string));
+        p = psets + strlen(pset_string);
+    }
     r = ff_avc_find_startcode(extradata, extradata + extradata_size);
     while (r < extradata + extradata_size) {
         const uint8_t *r1;
@@ -201,7 +233,7 @@ static int extradata2psets(AVFormatContext *s, const AVCodecParameters *par,
             r = r1;
             continue;
         }
-        if (p != (psets + strlen(pset_string))) {
+        if (!is_whip && p != (psets + strlen(pset_string))) {
             *p = ',';
             p++;
         }
@@ -209,7 +241,7 @@ static int extradata2psets(AVFormatContext *s, const AVCodecParameters *par,
             sps = r;
             sps_end = r1;
         }
-        if (!av_base64_encode(p, MAX_PSET_SIZE - (p - psets), r, r1 - r)) {
+        if (!is_whip && !av_base64_encode(p, MAX_PSET_SIZE - (p - psets), r, r1 - r)) {
             av_log(s, AV_LOG_ERROR, "Cannot Base64-encode %"PTRDIFF_SPECIFIER" %"PTRDIFF_SPECIFIER"!\n",
                    MAX_PSET_SIZE - (p - psets), r1 - r);
             av_free(psets);
@@ -510,11 +542,33 @@ static int latm_context2config(AVFormatContext *s, const AVCodecParameters *par,
 }
 
 static int sdp_write_media_attributes(char *buff, int size, const AVStream *st,
-                                      int payload_type, AVFormatContext *fmt)
+                                      int payload_type, AVFormatContext *fmt, AVDictionary **options)
 {
     char *config = NULL;
     const AVCodecParameters *p = st->codecpar;
     int ret = 0;
+    AVDictionaryEntry *e;
+    int is_whip = 0;
+    const char *ssrc, *msid = NULL, *msid_tracker = NULL;
+
+    AVDictionary *tmp_opts = NULL;
+    if (!options)
+        options = &tmp_opts;
+
+    if ((e = av_dict_get(*options, "mode", NULL, 0)) != NULL && e->value)
+        is_whip = !av_strncasecmp(e->value, "whip", 4);
+
+    if (is_whip) {
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            (e = av_dict_get(*options, "media_video_ssrc", NULL, 0)) && (ssrc = e->value);
+            (e = av_dict_get(*options, "media_video_msid", NULL, 0)) && (msid = e->value);
+            (e = av_dict_get(*options, "media_video_msid_tracker", NULL, 0)) && (msid_tracker = e->value);
+        } else {
+            (e = av_dict_get(*options, "media_audio_ssrc", NULL, 0)) && (ssrc = e->value);
+            (e = av_dict_get(*options, "media_audio_msid", NULL, 0)) && (msid = e->value);
+            (e = av_dict_get(*options, "media_audio_msid_tracker", NULL, 0)) && (msid_tracker = e->value);
+        }
+    }
 
     switch (p->codec_id) {
     case AV_CODEC_ID_DIRAC:
@@ -526,14 +580,20 @@ static int sdp_write_media_attributes(char *buff, int size, const AVStream *st,
             av_opt_flag_is_set(fmt->priv_data, "rtpflags", "h264_mode0"))
             mode = 0;
         if (p->extradata_size) {
-            ret = extradata2psets(fmt, p, &config);
+            ret = extradata2psets(fmt, p, options, &config);
             if (ret < 0)
                 return ret;
         }
-        av_strlcatf(buff, size, "a=rtpmap:%d H264/90000\r\n"
-                                "a=fmtp:%d packetization-mode=%d%s\r\n",
-                                 payload_type,
-                                 payload_type, mode, config ? config : "");
+        if (!is_whip)
+            av_strlcatf(buff, size, "a=rtpmap:%d H264/90000\r\n"
+                                    "a=fmtp:%d packetization-mode=%d%s\r\n",
+                                     payload_type,
+                                     payload_type, mode, config ? config : "");
+        else
+            av_strlcatf(buff, size, "a=rtpmap:%d H264/90000\r\n"
+                                    "a=fmtp:%d level-asymmetry-allowed=1;packetization-mode=%d%s\r\n",
+                                     payload_type,
+                                     payload_type, mode, config ? config : "");
         break;
     }
     case AV_CODEC_ID_H261:
@@ -794,7 +854,7 @@ static int sdp_write_media_attributes(char *buff, int size, const AVStream *st,
            receivers MUST be able to receive and process stereo packets. */
         av_strlcatf(buff, size, "a=rtpmap:%d opus/48000/2\r\n",
                                  payload_type);
-        if (p->ch_layout.nb_channels == 2) {
+        if (!is_whip && p->ch_layout.nb_channels == 2) {
             av_strlcatf(buff, size, "a=fmtp:%d sprop-stereo=1\r\n",
                                      payload_type);
         }
@@ -804,6 +864,11 @@ static int sdp_write_media_attributes(char *buff, int size, const AVStream *st,
         break;
     }
 
+    if (is_whip) {
+        av_strlcatf(buff, size, "a=ssrc:%s cname:%s\r\n", ssrc, msid);
+        av_strlcatf(buff, size, "a=ssrc:%s msid:%s %s\r\n", ssrc, msid, msid_tracker);
+    }
+
     av_free(config);
 
     return 0;
@@ -811,13 +876,46 @@ static int sdp_write_media_attributes(char *buff, int size, const AVStream *st,
 
 int ff_sdp_write_media(char *buff, int size, const AVStream *st, int idx,
                        const char *dest_addr, const char *dest_type,
-                       int port, int ttl, AVFormatContext *fmt)
+                       int port, int ttl, AVFormatContext *fmt, AVDictionary **options)
 {
     const AVCodecParameters *p = st->codecpar;
     const char *type;
     int payload_type;
+    AVDictionaryEntry *e;
+    int is_whip = 0, mid;
+    const char *proto = "RTP/AVP", *ufrag = NULL, *pwd = NULL, *fingerprint = NULL;
+    const char *msid = NULL, *msid_tracker = NULL;
+
+    AVDictionary *tmp_opts = NULL;
+    if (!options)
+        options = &tmp_opts;
+
+    if ((e = av_dict_get(*options, "mode", NULL, 0)) != NULL && e->value)
+        is_whip = !av_strncasecmp(e->value, "whip", 4);
+
+    if (is_whip) {
+        port = 9;
+        (e = av_dict_get(*options, "media_proto", NULL, 0)) && (proto = e->value);
+        (e = av_dict_get(*options, "media_dest_addr", NULL, 0)) && (dest_addr = e->value);
+        (e = av_dict_get(*options, "media_ice_ufrag", NULL, 0)) && (ufrag = e->value);
+        (e = av_dict_get(*options, "media_ice_pwd", NULL, 0)) && (pwd = e->value);
+        (e = av_dict_get(*options, "media_fingerprint", NULL, 0)) && (fingerprint = e->value);
+    }
 
     payload_type = ff_rtp_get_payload_type(fmt, st->codecpar, idx);
+    if (is_whip) {
+        if (p->codec_type == AVMEDIA_TYPE_VIDEO) {
+            (e = av_dict_get(*options, "media_video_payload_type", NULL, 0)) && (payload_type = atoi(e->value));
+            (e = av_dict_get(*options, "media_video_mid", NULL, 0)) && (mid = atoi(e->value));
+            (e = av_dict_get(*options, "media_video_msid", NULL, 0)) && (msid = e->value);
+            (e = av_dict_get(*options, "media_video_msid_tracker", NULL, 0)) && (msid_tracker = e->value);
+        } else {
+            (e = av_dict_get(*options, "media_audio_payload_type", NULL, 0)) && (payload_type = atoi(e->value));
+            (e = av_dict_get(*options, "media_audio_mid", NULL, 0)) && (mid = atoi(e->value));
+            (e = av_dict_get(*options, "media_audio_msid", NULL, 0)) && (msid = e->value);
+            (e = av_dict_get(*options, "media_audio_msid_tracker", NULL, 0)) && (msid_tracker = e->value);
+        }
+    }
 
     switch (p->codec_type) {
         case AVMEDIA_TYPE_VIDEO   : type = "video"      ; break;
@@ -826,21 +924,37 @@ int ff_sdp_write_media(char *buff, int size, const AVStream *st, int idx,
         default                 : type = "application"; break;
     }
 
-    av_strlcatf(buff, size, "m=%s %d RTP/AVP %d\r\n", type, port, payload_type);
+    av_strlcatf(buff, size, "m=%s %d %s %d\r\n", type, port, proto, payload_type);
     sdp_write_address(buff, size, dest_addr, dest_type, ttl);
-    if (p->bit_rate) {
+    if (!is_whip && p->bit_rate)
         av_strlcatf(buff, size, "b=AS:%"PRId64"\r\n", p->bit_rate / 1000);
+    if (is_whip) {
+        av_strlcatf(buff, size, "a=ice-ufrag:%s\r\n", ufrag);
+        av_strlcatf(buff, size, "a=ice-pwd:%s\r\n", pwd);
+        av_strlcatf(buff, size, "a=fingerprint:sha-256 %s\r\na=setup:passive\r\n", fingerprint);
+        av_strlcatf(buff, size, "a=mid:%d\r\na=sendonly\r\na=msid:%s %s\r\na=rtcp-mux\r\n", mid, msid, msid_tracker);
+        if (p->codec_type == AVMEDIA_TYPE_VIDEO)
+            av_strlcatf(buff, size, "a=rtcp-rsize\r\n");
     }
 
-    return sdp_write_media_attributes(buff, size, st, payload_type, fmt);
+    return sdp_write_media_attributes(buff, size, st, payload_type, fmt, options);
 }
 
-int av_sdp_create(AVFormatContext *ac[], int n_files, char *buf, int size)
+int av_sdp_create(AVFormatContext *ac[], int n_files, char *buf, int size, AVDictionary **options)
 {
     AVDictionaryEntry *title = av_dict_get(ac[0]->metadata, "title", NULL, 0);
     struct sdp_session_level s = { 0 };
     int i, j, port, ttl, is_multicast, index = 0;
     char dst[32], dst_type[5];
+    AVDictionaryEntry *e;
+    int is_whip = 0;
+
+    AVDictionary *tmp_opts = NULL;
+    if (!options)
+        options = &tmp_opts;
+
+    if ((e = av_dict_get(*options, "mode", NULL, 0)) != NULL && e->value)
+        is_whip = !av_strncasecmp(e->value, "whip", 4);
 
     memset(buf, 0, size);
     s.user = "-";
@@ -866,7 +980,7 @@ int av_sdp_create(AVFormatContext *ac[], int n_files, char *buf, int size)
             }
         }
     }
-    sdp_write_header(buf, size, &s);
+    sdp_write_header(buf, size, &s, options);
 
     dst[0] = 0;
     for (i = 0; i < n_files; i++) {
@@ -881,11 +995,11 @@ int av_sdp_create(AVFormatContext *ac[], int n_files, char *buf, int size)
             int ret = ff_sdp_write_media(buf, size, ac[i]->streams[j], index++,
                                          dst[0] ? dst : NULL, dst_type,
                                          (port > 0) ? port + j * 2 : 0,
-                                         ttl, ac[i]);
+                                         ttl, ac[i], options);
             if (ret < 0)
                 return ret;
 
-            if (port <= 0) {
+            if (!is_whip && port <= 0) {
                 av_strlcatf(buf, size,
                                    "a=control:streamid=%d\r\n", i + j);
             }
@@ -908,14 +1022,14 @@ int av_sdp_create(AVFormatContext *ac[], int n_files, char *buf, int size)
     return 0;
 }
 #else
-int av_sdp_create(AVFormatContext *ac[], int n_files, char *buf, int size)
+int av_sdp_create(AVFormatContext *ac[], int n_files, char *buf, int size, AVDictionary **options)
 {
     return AVERROR(ENOSYS);
 }
 
 int ff_sdp_write_media(char *buff, int size, const AVStream *st, int idx,
                        const char *dest_addr, const char *dest_type,
-                       int port, int ttl, AVFormatContext *fmt)
+                       int port, int ttl, AVFormatContext *fmt, AVDictionary **options)
 {
     return AVERROR(ENOSYS);
 }

@@ -3624,7 +3624,7 @@ static int mov_write_udta_sdp(AVIOContext *pb, MOVTrack *track)
     int len;
 
     ff_sdp_write_media(buf, sizeof(buf), ctx->streams[0], track->src_track,
-                       NULL, NULL, 0, 0, ctx);
+                       NULL, NULL, 0, 0, ctx, NULL);
     av_strlcatf(buf, sizeof(buf), "a=control:streamid=%d\r\n", track->track_id);
     len = strlen(buf);
 

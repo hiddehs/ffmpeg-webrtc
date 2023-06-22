@@ -512,7 +512,7 @@ uint64_t ff_parse_ntp_time(uint64_t ntp_ts);
  */
 int ff_sdp_write_media(char *buff, int size, const AVStream *st, int idx,
                        const char *dest_addr, const char *dest_type,
-                       int port, int ttl, AVFormatContext *fmt);
+                       int port, int ttl, AVFormatContext *fmt, AVDictionary **options);
 
 /**
  * Read a whole line of text from AVIOContext. Stop reading after reaching

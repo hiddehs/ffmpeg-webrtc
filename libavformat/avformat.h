@@ -2685,7 +2685,7 @@ int av_filename_number_test(const char *filename);
  * @param size the size of the buffer
  * @return 0 if OK, AVERROR_xxx on error
  */
-int av_sdp_create(AVFormatContext *ac[], int n_files, char *buf, int size);
+int av_sdp_create(AVFormatContext *ac[], int n_files, char *buf, int size, AVDictionary **options);
 
 /**
  * Return a positive value if the given filename has one of the given
