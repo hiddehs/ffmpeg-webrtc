@@ -41,3 +41,6 @@
 /src
 /mapfile
 /tools/python/__pycache__/
+/macos-out
+/win-out
+macos-out.zip

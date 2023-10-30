@@ -1,27 +1,5 @@
-## Installing FFmpeg
-
-1. Type `./configure` to create the configuration. A list of configure
-options is printed by running `configure --help`.
-
-    `configure` can be launched from a directory different from the FFmpeg
-sources to build the objects out of tree. To do this, use an absolute
-path when launching `configure`, e.g. `/ffmpegdir/ffmpeg/configure`.
-
-2. Then type `make` to build FFmpeg. GNU Make 3.81 or later is required.
-
-3. Type `make install` to install all binaries and libraries you built.
-
-NOTICE
-------
-
- - Non system dependencies (e.g. libx264, libvpx) are disabled by default.
-
-
-## Example webrtc build
-
-With LDFlags for build on MacOS
-
-```sh
+#!/bin/bash
+echo "configuring..." 
 export LDFLAGS=-Wl,-ld_classic
 export DESTDIR=macos-out/
 ./configure --enable-shared --enable-rpath \
@@ -62,7 +40,10 @@ export DESTDIR=macos-out/
             --enable-neon \
             --enable-videotoolbox \
             --enable-audiotoolbox
+echo "making"
 make -j 10
+echo "installing"
+
 make install -j 10
+echo "zipping"
 zip -r macos-out.zip macos-out
-```
