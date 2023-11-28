@@ -854,12 +854,12 @@ build_amd_amf=y
 disable_nonfree=y # comment out to force user y/n selection
 original_cflags='-mtune=generic -O3' # high compatible by default, see #219, some other good options are listed below, or you could use -march=native to target your local box:
 original_cppflags='-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0' # Needed for mingw-w64 7 as FORTIFY_SOURCE is now partially implemented, but not actually working
-ffmpeg_git_checkout_version=
 build_ismindex=n
 enable_gpl=y
 build_x264_with_libav=y # To build x264 with Libavformat.
-ffmpeg_git_checkout="https://github.com/FFmpeg/FFmpeg.git"
-ffmpeg_source_dir=
+#ffmpeg_git_checkout_version=
+#ffmpeg_git_checkout="https://github.com/FFmpeg/FFmpeg.git"
+#ffmpeg_source_dir=
 build_svt_hevc=n
 
 non_free=y
@@ -1076,10 +1076,10 @@ if [[ ! -f $prefix/lib/libopus.a ]]; then
   build_libopus
 fi
 
-make clean
+#    --pkg-config-flags=--static \
+#make clean
 ./configure \
     --arch=x86_64 --target-os=mingw32 --cross-prefix=x86_64-w64-mingw32- \
-    --pkg-config-flags=--static \
     --pkg-config=pkg-config --prefix=$prefix/ffmpeg-win64 \
     --extra-ldflags=-pthread \
     --extra-cflags=-DLIBTWOLAME_STATIC \
@@ -1103,9 +1103,9 @@ make -j$cpu_count && make install && echo "done installing it $prefix/ffmpeg-win
 cd $prefix
 # TODO: Make these static as well? why is this required
 echo "copying extra libs"
-cp lib/libwinpthread-1.dll ffmpeg-win64/bin/libwinpthread-1.dll
-cp lib/libcrypto-3-x64.dll ffmpeg-win64/bin/libcrypto-3-x64.dll
-cp lib/libssl-3-x64.dll ffmpeg-win64/bin/libssl-3-x64.dll
+cp bin/libwinpthread-1.dll ffmpeg-win64/bin/libwinpthread-1.dll
+cp bin/libcrypto-3-x64.dll ffmpeg-win64/bin/libcrypto-3-x64.dll
+cp bin/libssl-3-x64.dll ffmpeg-win64/bin/libssl-3-x64.dll
 
 
 echo "zipping"
