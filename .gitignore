@@ -44,3 +44,17 @@
 /macos-out
 /win-out
 macos-out.zip
+sandbox_quick
+x264
+x264*
+x265*
+x265
+x265_*
+openssl
+zlib-*
+openssl-*
+macos-out
+sandbox_quick
+libvpx-1.13.1
+libvpx_git
+
