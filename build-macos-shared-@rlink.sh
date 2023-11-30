@@ -1,12 +1,26 @@
 #!/bin/bash
-echo "configuring..." 
+cpu_count="$(grep -c processor /proc/cpuinfo 2>/dev/null)" # linux cpu count
+if [ -z "$cpu_count" ]; then
+  cpu_count=`sysctl -n hw.ncpu | tr -d '\n'` # OS X cpu count
+  if [ -z "$cpu_count" ]; then
+    echo "warning, unable to determine cpu count, defaulting to 1"
+    cpu_count=1 # else default to just 1, instead of blank, which means infinite
+  fi
+fi
+
+echo "cpu count $cpu_count"
+
+
+echo "configuring..."
 export LDFLAGS=-Wl,-ld_classic
 export DESTDIR=macos-out/
 ./configure --enable-shared --enable-rpath \
             --install-name-dir='@rpath' \
             --enable-pthreads \
-            --enable-version3 \
             --enable-gpl \
+            --enable-version3 \
+            --enable-muxer=whip \
+            --enable-openssl \
             --enable-libaom \
             --enable-libjxl \
             --enable-libopus \
@@ -20,6 +34,7 @@ export DESTDIR=macos-out/
             --enable-libvorbis \
             --enable-libvpx \
             --enable-libwebp \
+            --enable-libx264 \
             --enable-libx265 \
             --enable-libxml2 \
             --enable-libfontconfig \
@@ -31,19 +46,14 @@ export DESTDIR=macos-out/
             --enable-libzimg \
             --disable-libjack \
             --disable-indev=jack \
-            --enable-muxer=whip \
-            --enable-openssl \
-            --enable-version3 \
-            --enable-libx264 \
-            --enable-gpl \
-            --enable-libopus \
             --enable-neon \
             --enable-videotoolbox \
             --enable-audiotoolbox
 echo "making"
-make -j 10
+make -j $cpu_count || exit 1
 echo "installing"
 
-make install -j 10
+make install -j $cpu_count  || exit 1
 echo "zipping"
-zip -r macos-out.zip macos-out
+
+zip -r ffmpeg@6-webrtc-macos.zip macos-out

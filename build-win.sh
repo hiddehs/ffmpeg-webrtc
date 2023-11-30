@@ -1089,7 +1089,6 @@ fi
     --disable-w32threads \
     --enable-rpath \
     --install-name-dir='@rpath' \
-    --enable-shared \
     --enable-gpl --enable-version3 --enable-openssl --enable-nonfree \
     --enable-muxer=whip \
     --enable-libx264 \
