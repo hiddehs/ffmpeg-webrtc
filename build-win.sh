@@ -1076,6 +1076,11 @@ if [[ ! -f $prefix/lib/libopus.a ]]; then
   build_libopus
 fi
 
+
+cd nv-codec-headers
+make PREFIX=$prefix install
+cd ../
+
 #    --pkg-config-flags=--static \
 #make clean
 ./configure \
@@ -1094,6 +1099,8 @@ fi
     --enable-libx264 \
     --enable-libopus \
     --enable-libvpx \
+    --enable-ffnvcodec \
+    --enable-cuda-llvm \
     --disable-doc --disable-optimizations \
      || exit 1
 make -j$cpu_count && make install && echo "done installing it $prefix/ffmpeg-win64"
