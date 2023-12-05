@@ -1099,6 +1099,7 @@ cd ../
     --enable-libx264 \
     --enable-libopus \
     --enable-libvpx \
+    --disable-sdl2 \
     --disable-doc --disable-optimizations \
      || exit 1
 make -j$cpu_count && make install && echo "done installing it $prefix/ffmpeg-win64"

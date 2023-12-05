@@ -72,6 +72,8 @@ export CFLAGS="$LIBS"
             --enable-libvpx \
             --enable-libx265 \
             --enable-neon \
+            --disable-sdl2 \
+            --disable-ffplay \
             --enable-videotoolbox \
             --enable-audiotoolbox \
             || exit 1
