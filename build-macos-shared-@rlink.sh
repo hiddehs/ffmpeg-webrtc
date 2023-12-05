@@ -1,4 +1,7 @@
 #!/bin/bash
+
+set -x
+
 cpu_count="$(grep -c processor /proc/cpuinfo 2>/dev/null)" # linux cpu count
 if [ -z "$cpu_count" ]; then
   cpu_count=`sysctl -n hw.ncpu | tr -d '\n'` # OS X cpu count
@@ -16,6 +19,7 @@ export LDFLAGS=-Wl,-ld_classic
 export DESTDIR=macos-out/
 ./configure --enable-shared --enable-rpath \
             --install-name-dir='@rpath' \
+            --extra-libs="-L//opt/homebrew/Cellar/openssl@3/3.2.0/lib -lssl -lcrypto" \
             --enable-pthreads \
             --enable-gpl \
             --enable-version3 \
@@ -48,7 +52,7 @@ export DESTDIR=macos-out/
             --disable-indev=jack \
             --enable-neon \
             --enable-videotoolbox \
-            --enable-audiotoolbox
+            --enable-audiotoolbox || exit 1
 echo "making"
 make -j $cpu_count || exit 1
 echo "installing"

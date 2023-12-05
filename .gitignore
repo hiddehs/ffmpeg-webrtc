@@ -60,3 +60,7 @@ libvpx_git
 
 /ffmpeg@6-webrtc-win64.zip
 nv-coded-headers
+macos-*
+build-*.log
+zlib
+libvpx
