@@ -1,14 +1,14 @@
 #!/bin/sh
 
-#set -x
+set -x
 
 ENABLE_FFPLAY=FALSE
 ENABLE_TOPAZ=FALSE
 ENABLE_AVISYNTHPLUS=FALSE
 BUILD_FROM_MAIN=FALSE
 
-ACTION=nothing
-export ACTION=nothing
+ACTION=clean
+export ACTION=clean
 
 # some folder names
 BASE_DIR="$( cd "$( dirname "$0" )" > /dev/null 2>&1 && pwd )"
@@ -119,11 +119,11 @@ COMPILATION_START_TIME=$(currentTimeInSeconds)
 #checkStatus $? "build libass"
 #echoDurationInSections $START_TIME
 #
-START_TIME=$(currentTimeInSeconds)
-echoSection "compile fdk-aac"
-$SCRIPT_DIR/build-fdk-aac.sh "$SCRIPT_DIR" "$WORKING_DIR" "$TOOL_DIR" "2.0.2" > "$WORKING_DIR/build-fdk-aac.log" 2>&1
-checkStatus $? "build fdk-aac"
-echoDurationInSections $START_TIME
+#START_TIME=$(currentTimeInSeconds)
+#echoSection "compile fdk-aac"
+#$SCRIPT_DIR/build-fdk-aac.sh "$SCRIPT_DIR" "$WORKING_DIR" "$TOOL_DIR" "2.0.2" > "$WORKING_DIR/build-fdk-aac.log" 2>&1
+#checkStatus $? "build fdk-aac"
+#echoDurationInSections $START_TIME
 #
 #START_TIME=$(currentTimeInSeconds)
 #echoSection "compile x265"
@@ -149,11 +149,11 @@ echoDurationInSections $START_TIME
 #checkStatus $? "build vorbis"
 #echoDurationInSections $START_TIME
 #
-START_TIME=$(currentTimeInSeconds)
-echoSection "compile aom"
-$SCRIPT_DIR/build-aom.sh "$SCRIPT_DIR" "$WORKING_DIR" "$TOOL_DIR" "$CPUS" "2.0.0" > "$WORKING_DIR/build-aom.log" 2>&1
-checkStatus $? "build aom"
-echoDurationInSections $START_TIME
+#START_TIME=$(currentTimeInSeconds)
+#echoSection "compile aom"
+#$SCRIPT_DIR/build-aom.sh "$SCRIPT_DIR" "$WORKING_DIR" "$TOOL_DIR" "$CPUS" "2.0.0" > "$WORKING_DIR/build-aom.log" 2>&1
+#checkStatus $? "build aom"
+#echoDurationInSections $START_TIME
 #
 ##START_TIME=$(currentTimeInSeconds)
 ##echoSection "compile openh264"
@@ -168,20 +168,20 @@ echoDurationInSections $START_TIME
 #checkStatus $? "build x264"
 #echoDurationInSections $START_TIME
 #
-START_TIME=$(currentTimeInSeconds)
-echoSection "compile vpx"
-$SCRIPT_DIR/build-vpx.sh "$SCRIPT_DIR" "$WORKING_DIR" "$TOOL_DIR" "$CPUS" "1.9.0" > "$WORKING_DIR/build-vpx.log" 2>&1
-checkStatus $? "build vpx"
-echoDurationInSections $START_TIME
+#START_TIME=$(currentTimeInSeconds)
+#echoSection "compile vpx"
+#$SCRIPT_DIR/build-vpx.sh "$SCRIPT_DIR" "$WORKING_DIR" "$TOOL_DIR" "$CPUS" "1.9.0" > "$WORKING_DIR/build-vpx.log" 2>&1
+#checkStatus $? "build vpx"
+#echoDurationInSections $START_TIME
 
-START_TIME=$(currentTimeInSeconds)
-echoSection "compile lame (mp3)"
-$SCRIPT_DIR/build-lame.sh "$SCRIPT_DIR" "$WORKING_DIR" "$TOOL_DIR" "3.100" > "$WORKING_DIR/build-lame.log" 2>&1
-checkStatus $? "build lame"
-echoDurationInSections $START_TIME
+#START_TIME=$(currentTimeInSeconds)
+#echoSection "compile lame (mp3)"
+#$SCRIPT_DIR/build-lame.sh "$SCRIPT_DIR" "$WORKING_DIR" "$TOOL_DIR" "3.100" > "$WORKING_DIR/build-lame.log" 2>&1
+#checkStatus $? "build lame"
+#echoDurationInSections $START_TIME
 
-START_TIME=$(currentTimeInSeconds)
-echoSection "compile opus"
-$SCRIPT_DIR/build-opus.sh "$SCRIPT_DIR" "$WORKING_DIR" "$TOOL_DIR" "$CPUS" "1.3.1" > "$WORKING_DIR/build-opus.log" 2>&1
-checkStatus $? "build opus"
-echoDurationInSections $START_TIME
+#START_TIME=$(currentTimeInSeconds)
+#echoSection "compile opus"
+#$SCRIPT_DIR/build-opus.sh "$SCRIPT_DIR" "$WORKING_DIR" "$TOOL_DIR" "$CPUS" "1.3.1" > "$WORKING_DIR/build-opus.log" 2>&1
+#checkStatus $? "build opus"
+#echoDurationInSections $START_TIME

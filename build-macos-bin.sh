@@ -21,6 +21,33 @@ echo "cpu count $cpu_count"
 
 echo "configuring..."
 
+
+BASE_DIR="$( cd "$( dirname "$0" )" > /dev/null 2>&1 && pwd )"
+echo "base directory is ${BASE_DIR}"
+SCRIPT_DIR="${BASE_DIR}/ffmpeg-apple-arm64-build/build"
+echo "script directory is ${SCRIPT_DIR}"
+TEST_DIR="${BASE_DIR}/macos-test"
+echo "test directory is ${TEST_DIR}"
+WORKING_DIR="$( pwd )"
+echo "working directory is ${WORKING_DIR}"
+TOOL_DIR="$WORKING_DIR/macos-tool"
+echo "tool directory is ${TOOL_DIR}"
+OUT_DIR="$WORKING_DIR/macos-build-out"
+echo "output directory is ${OUT_DIR}"
+
+
+
+if [[ ! -f $TOOL_DIR/lib/libssl.a ]]; then
+  cd openssl-3.0.0 || exit 1
+  ./config no-tests no-threads no-shared --libdir=$TOOL_DIR/lib --prefix=$TOOL_DIR || exit 1
+  # ./configure shared mingw64 --prefix=$prefix || exit 1
+  make clean || exit 1
+  make -j$cpu_count || exit 1
+  make install || exit 1
+  cd ..
+fi
+
+
 libdir=macos-tool
 export LIBS="-L$libdir/lib -I$libdir/include"
 export LDFLAGS="$LIBS -Wl,-ld_classic"
@@ -36,17 +63,28 @@ export CFLAGS="$LIBS"
             --enable-pthreads \
             --enable-version3 \
             --enable-nonfree \
+            --enable-muxer=whip \
+            --enable-openssl \
             --enable-libx264 \
-            --enable-libwebp \
+            --enable-libopus \
             --enable-libfdk-aac \
-            --enable-libaom \
             --enable-libmp3lame \
             --enable-libvpx \
+            --enable-libx265 \
+            --enable-neon \
+            --enable-videotoolbox \
+            --enable-audiotoolbox \
             || exit 1
 
 
+echo "making"
+make -j $cpu_count || exit 1
+echo "installing"
 
+make install -j $cpu_count  || exit 1
+echo "zipping"
 
+zip -r ffmpeg@6-webrtc-macos.zip $OUT_DIR
 
 #            --enable-pthreads \
 #                        --enable-version3 \
@@ -80,12 +118,3 @@ export CFLAGS="$LIBS"
 #                        --enable-neon \
 #                        --enable-videotoolbox \
 #                        --enable-audiotoolbox
-
-echo "making"
-make -j $cpu_count || exit 1
-echo "installing"
-
-make install -j $cpu_count  || exit 1
-echo "zipping"
-
-zip -r ffmpeg@6-webrtc-macos.zip macos-out
