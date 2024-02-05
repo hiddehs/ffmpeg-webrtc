@@ -64,3 +64,4 @@ macos-*
 build-*.log
 zlib
 libvpx
+x265

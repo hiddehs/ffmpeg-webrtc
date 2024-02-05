@@ -66,3 +66,18 @@ make -j 10
 make install -j 10
 zip -r macos-out.zip macos-out
 ```
+
+
+### note on macos arm method
+
+
+```shell
+./build-macos-deps.sh
+# check logging output
+
+# pkg-config must be configured with the correct path, 
+# after moving tool directories: REBUILD!
+
+./build-macos-bin.sh
+```
+

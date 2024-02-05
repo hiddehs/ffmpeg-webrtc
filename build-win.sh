@@ -698,7 +698,7 @@ download_and_unpack_file() {
 generic_configure() {
   build_triple="${build_triple:-$(gcc -dumpmachine)}"
   local extra_configure_options="$1"
-  if [[ -n $build_triple ]]; then extra_configure_options+=" --build=$build_triple"; fi
+#  if [[ -n $build_triple ]]; then extra_configure_options+=" --build=$build_triple"; fi
   do_configure "--host=$host_target --prefix=$mingw_w64_x86_64_prefix --disable-shared --enable-static $extra_configure_options"
 }
 
@@ -883,9 +883,9 @@ build_libx264() {
 
   if [[ $prefer_stable = "n" ]]; then
     checkout_dir="${checkout_dir}_unstable"
-    do_git_checkout "https://code.videolan.org/videolan/x264.git" $checkout_dir "origin/master" 
+    do_git_checkout "https://code.videolan.org/videolan/x264.git" $checkout_dir "origin/master"
   else
-    do_git_checkout "https://code.videolan.org/videolan/x264.git" $checkout_dir  "origin/stable" 
+    do_git_checkout "https://code.videolan.org/videolan/x264.git" $checkout_dir  "origin/stable"
   fi
   cd $checkout_dir
     if [[ ! -f configure.bak ]]; then # Change CFLAGS.
@@ -1017,6 +1017,140 @@ if [[ ! -f $prefix/lib/libx265.a ]]; then
   build_libx265
 fi
 
+
+build_libzlib() {
+#   see https://github.com/BtbN/FFmpeg-Builds/blob/master/scripts.d/20-libxml2.sh
+  do_git_checkout https://github.com/madler/zlib.git libzlib_git "v1.3.1"
+  cd libzlib_git
+#  export CC="${cross_prefix}gcc"
+#  export AR="${cross_prefix}ar"
+#  export CC="${FFBUILD_CROSS_PREFIX}gcc"
+#  export AR="${FFBUILD_CROSS_PREFIX}ar"
+  do_configure "--prefix=$mingw_w64_x86_64_prefix --static"
+#  make clean
+#  CHOST=$host make -j12
+#  do_cmake_and_install
+  do_make_and_make_install "-nostartfiles"
+  cd ..
+}
+
+
+if [[ ! -f $prefix/lib/libz.a ]]; then
+  build_libzlib
+fi
+
+
+
+
+
+
+build_libwebp() {
+  do_git_checkout https://chromium.googlesource.com/webm/libwebp.git libwebp_git v1.2.4
+  cd libwebp_git
+    export LIBPNG_CONFIG="$mingw_w64_x86_64_prefix/bin/libpng-config --static" # LibPNG somehow doesn't get autodetected.
+    generic_configure "--disable-wic"
+    do_make_and_make_install
+    unset LIBPNG_CONFIG
+  cd ..
+}
+
+build_dlfcn() {
+  do_git_checkout https://github.com/dlfcn-win32/dlfcn-win32.git
+  cd dlfcn-win32_git
+    if [[ ! -f Makefile.bak ]]; then # Change CFLAGS.
+      sed -i.bak "s/-O3/-O2/" Makefile
+    fi
+    do_configure "--prefix=$mingw_w64_x86_64_prefix --cross-prefix=$cross_prefix" # rejects some normal cross compile options so custom here
+    do_make_and_make_install
+    gen_ld_script libdl.a dl_s -lpsapi # dlfcn-win32's 'README.md': "If you are linking to the static 'dl.lib' or 'libdl.a', then you would need to explicitly add 'psapi.lib' or '-lpsapi' to your linking command, depending on if MinGW is used."
+  cd ..
+}
+
+build_bzip2() {
+  download_and_unpack_file https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz
+  cd bzip2-1.0.8
+    apply_patch file://$patch_dir/bzip2-1.0.8_brokenstuff.diff
+    if [[ ! -f ./libbz2.a ]] || [[ -f $mingw_w64_x86_64_prefix/lib/libbz2.a && ! $(/usr/bin/env md5sum ./libbz2.a) = $(/usr/bin/env md5sum $mingw_w64_x86_64_prefix/lib/libbz2.a) ]]; then # Not built or different build installed
+      do_make "$make_prefix_options libbz2.a"
+      install -m644 bzlib.h $mingw_w64_x86_64_prefix/include/bzlib.h
+      install -m644 libbz2.a $mingw_w64_x86_64_prefix/lib/libbz2.a
+    else
+      echo "Already made bzip2-1.0.8"
+    fi
+  cd ..
+}
+
+build_liblzma() {
+  download_and_unpack_file https://sourceforge.net/projects/lzmautils/files/xz-5.2.5.tar.xz
+  cd xz-5.2.5
+    generic_configure "--disable-xz --disable-xzdec --disable-lzmadec --disable-lzmainfo --disable-scripts --disable-doc --disable-nls"
+    do_make_and_make_install
+  cd ..
+}
+
+build_zlib() {
+  download_and_unpack_file https://github.com/madler/zlib/archive/v1.2.11.tar.gz zlib-1.2.11
+  cd zlib-1.2.11
+    local make_options
+    if [[ $compiler_flavors == "native" ]]; then
+      export CFLAGS="$CFLAGS -fPIC" # For some reason glib needs this even though we build a static library
+    else
+      export ARFLAGS=rcs # Native can't take ARFLAGS; https://stackoverflow.com/questions/21396988/zlib-build-not-configuring-properly-with-cross-compiler-ignores-ar
+    fi
+    do_configure "--prefix=$mingw_w64_x86_64_prefix --static"
+    do_make_and_make_install "$make_prefix_options ARFLAGS=rcs"
+    if [[ $compiler_flavors == "native" ]]; then
+      reset_cflags
+    else
+      unset ARFLAGS
+    fi
+  cd ..
+}
+
+build_iconv() {
+  download_and_unpack_file https://ftp.gnu.org/pub/gnu/libiconv/libiconv-1.16.tar.gz
+  cd libiconv-1.16
+    generic_configure "--disable-nls"
+    do_make "install-lib" # No need for 'do_make_install', because 'install-lib' already has install-instructions.
+  cd ..
+}
+
+build_mingw_std_threads() {
+  do_git_checkout https://github.com/meganz/mingw-std-threads.git # it needs std::mutex too :|
+  cd mingw-std-threads_git
+    cp *.h "$mingw_w64_x86_64_prefix/include"
+  cd ..
+}
+
+build_libxml2() {
+  download_and_unpack_file http://xmlsoft.org/sources/libxml2-2.9.10.tar.gz libxml2-2.9.10
+  cd libxml2-2.9.10
+    generic_configure "--with-ftp=no --with-http=no --with-python=no"
+    do_make_and_make_install
+  cd ..
+}
+build_fontconfig() {
+  download_and_unpack_file https://www.freedesktop.org/software/fontconfig/release/fontconfig-2.13.92.tar.xz
+  cd fontconfig-2.13.92
+    #export CFLAGS= # compile fails with -march=sandybridge ... with mingw 4.0.6 at least ...
+    generic_configure "--enable-iconv --enable-libxml2 --disable-docs --with-libiconv" # Use Libxml2 instead of Expat.
+    do_make_and_make_install
+    #reset_cflags
+  cd ..
+}
+
+build_mingw_std_threads
+build_zlib # Zlib in FFmpeg is autodetected.
+build_libcaca # Uses zlib and dlfcn (on windows).
+build_bzip2 # Bzlib (bzip2) in FFmpeg is autodetected.
+build_liblzma # Lzma in FFmpeg is autodetected. Uses dlfcn.
+build_iconv # Iconv in FFmpeg is autodetected. Uses dlfcn.
+
+build_libwebp
+build_libxml2
+#build_fontconfig
+
+
 build_openssl() {
   # git clone https://github.com/openssl/openssl.git
   # cd openssl
@@ -1028,7 +1162,7 @@ build_openssl() {
   # echo $prefix/include
   # ls -la $prefix/include
   # exit 1
-  ./Configure no-tests mingw64 no-threads --libdir=$prefix/lib --cross-compile-prefix=x86_64-w64-mingw32- --prefix=$prefix || exit 1
+  ./Configure no-tests mingw64 no-threads no-shared --libdir=$prefix/lib --cross-compile-prefix=x86_64-w64-mingw32- --prefix=$prefix || exit 1
   # ./configure shared mingw64 --prefix=$prefix || exit 1
   make clean
   make -j$cpu_count
@@ -1051,7 +1185,7 @@ build_libvpx() {
     else
       local config_options="--target=x86_64-win64-gcc"
     fi
-    export CROSS="$cross_prefix"  
+    export CROSS="$cross_prefix"
     # VP8 encoder *requires* sse3 support
     do_configure "$config_options --prefix=$mingw_w64_x86_64_prefix --enable-ssse3 --enable-static --disable-shared --disable-examples --disable-tools --disable-docs --disable-unit-tests --enable-vp9-highbitdepth --extra-cflags=-fno-asynchronous-unwind-tables --extra-cflags=-mstackrealign" # fno for Error: invalid register for .seh_savexmm
     do_make_and_make_install
@@ -1081,11 +1215,11 @@ cd nv-codec-headers
 make PREFIX=$prefix install
 cd ../
 
-#    --pkg-config-flags=--static \
-#make clean
+make clean
 ./configure \
     --arch=x86_64 --target-os=mingw32 --cross-prefix=x86_64-w64-mingw32- \
     --pkg-config=pkg-config --prefix=$prefix/ffmpeg-win64 \
+    --pkg-config-flags=--static \
     --extra-ldflags=-pthread \
     --extra-cflags=-DLIBTWOLAME_STATIC \
     --disable-debug \
@@ -1094,23 +1228,29 @@ cd ../
     --disable-w32threads \
     --enable-rpath \
     --install-name-dir='@rpath' \
-    --enable-gpl --enable-version3 --enable-openssl --enable-nonfree \
+    --enable-gpl --enable-version3 \
+    --enable-openssl --enable-nonfree \
+    --enable-demuxer=dash \
+    --enable-libxml2 \
     --enable-muxer=whip \
     --enable-libx264 \
     --enable-libopus \
     --enable-libvpx \
-    --disable-sdl2 \
-    --disable-doc --disable-optimizations \
-     || exit 1
+    --disable-sdl2 --disable-ffplay \
+    --disable-doc --disable-optimizations || exit 1
 make -j$cpu_count && make install && echo "done installing it $prefix/ffmpeg-win64"
 
+#    --enable-libwebp \
+
+
+exit 1
 
 cd $prefix
 # TODO: Make these static as well? why is this required
-echo "copying extra libs"
-cp bin/libwinpthread-1.dll ffmpeg-win64/bin/libwinpthread-1.dll
-cp bin/libcrypto-3-x64.dll ffmpeg-win64/bin/libcrypto-3-x64.dll
-cp bin/libssl-3-x64.dll ffmpeg-win64/bin/libssl-3-x64.dll
+#echo "copying extra libs"
+#cp bin/libwinpthread-1.dll ffmpeg-win64/bin/libwinpthread-1.dll
+#cp bin/libcrypto-3-x64.dll ffmpeg-win64/bin/libcrypto-3-x64.dll
+#cp bin/libssl-3-x64.dll ffmpeg-win64/bin/libssl-3-x64.dll
 
 
 echo "zipping"

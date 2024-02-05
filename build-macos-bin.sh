@@ -1,6 +1,5 @@
 #!/bin/bash
 
-
 if [[ $1 == "dep" ]];
 then
 ./build-macos-deps.sh || exit 1
@@ -35,7 +34,9 @@ echo "tool directory is ${TOOL_DIR}"
 OUT_DIR="$WORKING_DIR/macos-build-out"
 echo "output directory is ${OUT_DIR}"
 
+export PKG_CONFIG_PATH="${TOOL_DIR}/bin/pkg-config" # let ffmpeg find our dependencies [currently not working :| ]
 
+#ls -la $TOOL_DIR/lib/pkgconfig
 
 if [[ ! -f $TOOL_DIR/lib/libssl.a ]]; then
   cd openssl-3.0.0 || exit 1
@@ -53,9 +54,10 @@ export LIBS="-L$libdir/lib -I$libdir/include"
 export LDFLAGS="$LIBS -Wl,-ld_classic"
 export CFLAGS="$LIBS"
 #export DESTDIR=macos-out/
-./configure --prefix="macos-build-out" --enable-gpl \
+./configure --prefix="macos-build-out" \
+            --enable-gpl \
             --pkg-config-flags="--static" \
-            --pkg-config=macos-tool/bin/pkg-config \
+            --pkg-config=$PKG_CONFIG_PATH \
             --enable-shared \
             --enable-rpath \
             --install-name-dir='@rpath' \
@@ -63,10 +65,12 @@ export CFLAGS="$LIBS"
             --enable-pthreads \
             --enable-version3 \
             --enable-nonfree \
+            --enable-libxml2 \
             --enable-muxer=whip \
+            --enable-demuxer=dash \
             --enable-openssl \
-            --enable-libx264 \
             --enable-libopus \
+            --enable-libx264 \
             --enable-libfdk-aac \
             --enable-libmp3lame \
             --enable-libvpx \

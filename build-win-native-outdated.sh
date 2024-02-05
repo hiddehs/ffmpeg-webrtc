@@ -885,9 +885,9 @@ build_libx264() {
 
   if [[ $prefer_stable = "n" ]]; then
     checkout_dir="${checkout_dir}_unstable"
-    do_git_checkout "https://code.videolan.org/videolan/x264.git" $checkout_dir "origin/master" 
+    do_git_checkout "https://code.videolan.org/videolan/x264.git" $checkout_dir "origin/master"
   else
-    do_git_checkout "https://code.videolan.org/videolan/x264.git" $checkout_dir  "origin/stable" 
+    do_git_checkout "https://code.videolan.org/videolan/x264.git" $checkout_dir  "origin/stable"
   fi
   cd $checkout_dir
     if [[ ! -f configure.bak ]]; then # Change CFLAGS.
@@ -1053,7 +1053,7 @@ build_libvpx() {
     else
       local config_options="--target=x86_64-win64-gcc"
     fi
-    export CROSS="$cross_prefix"  
+    export CROSS="$cross_prefix"
     # VP8 encoder *requires* sse3 support
     do_configure "$config_options --prefix=$mingw_w64_x86_64_prefix --enable-ssse3 --enable-static --disable-shared --disable-examples --disable-tools --disable-docs --disable-unit-tests --enable-vp9-highbitdepth --extra-cflags=-fno-asynchronous-unwind-tables --extra-cflags=-mstackrealign" # fno for Error: invalid register for .seh_savexmm
     do_make_and_make_install
@@ -1098,6 +1098,7 @@ cd ../
     --install-name-dir='@rpath' \
     --enable-gpl --enable-version3 --enable-openssl --enable-nonfree \
     --enable-muxer=whip \
+    --enable-demuxer=dash \
     --enable-libx264 \
     --enable-libopus \
     --enable-libvpx \
